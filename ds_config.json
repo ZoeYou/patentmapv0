@@ -1,0 +1,23 @@
+{
+  "train_micro_batch_size_per_gpu": "auto",
+  "gradient_accumulation_steps": "auto",
+  "zero_optimization": {
+      "stage": 1,
+      "overlap_comm": false,
+      "reduce_bucket_size": 5e8,
+      "allgather_bucket_size": 5e8
+  },
+  "fp16": {
+      "enabled": true,
+      "initial_scale_power": 12
+  },
+  "activation_checkpointing": {
+      "partition_activations": false
+  },
+  "find_unused_parameters": true,
+  "checkpoint": {
+      "use_compression": false,
+      "tag_validation": "Ignore"
+  },
+  "wall_clock_breakdown": false
+}
