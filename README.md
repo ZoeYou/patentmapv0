@@ -1,6 +1,6 @@
 # PatentMap v0
 
-A patent document embedding and similarity learning framework that uses contrastive learning techniques, specifically designed for patent document understanding and retrieval tasks.
+A patent document embedding and similarity learning framework that uses self-supervised contrastive learning techniques, specifically designed for patent document understanding and retrieval tasks.
 
 
 ## Features
@@ -40,8 +40,9 @@ The canonical dependency list is `requirements.txt`. For GPU-enabled installatio
 conda create -n patentmap python=3.9
 conda activate patentmap
 
-# Install PyTorch (CUDA 12.1 example) - adjust CUDA version as needed. See PyTorch website for the correct channel and CUDA combo.
-conda install -c pytorch -c nvidia pytorch==2.4.1 pytorch-cuda=12.1
+# Install PyTorch with CUDA support (recommended: use pip with explicit CUDA index)
+# For CUDA 12.4 (compatible with CUDA 12.x drivers):
+pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu124
 
 # Install FAISS (CPU or GPU)
 conda install -c conda-forge faiss-cpu
@@ -57,6 +58,20 @@ DeepSpeed is optional and used for accelerated or memory-efficient training. Ins
 Recommended quick install (pip):
 ```bash
 pip install deepspeed==0.17.1
+```
+
+### Troubleshooting: FAISS Import Error
+
+If you encounter a `GLIBCXX_3.4.30 not found` error when importing FAISS, set the library path before running Python:
+
+```bash
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
+```
+
+To make this permanent, add it to your conda environment activation:
+```bash
+mkdir -p $CONDA_PREFIX/etc/conda/activate.d
+echo 'export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH' > $CONDA_PREFIX/etc/conda/activate.d/env_vars.sh
 ```
 
 ## Data Preparation
@@ -128,6 +143,7 @@ Before running training or evaluation scripts, you should download the downstrea
 
 ```bash
 cd patentmap_eval/data
+conda install -c conda-forge git-lfs
 git lfs install
 git clone https://huggingface.co/datasets/ZoeYou/downstream
 ```

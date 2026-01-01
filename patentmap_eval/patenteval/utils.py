@@ -11,8 +11,6 @@ from torch.utils.data import Dataset
 import faiss
 import torch.nn as nn
 
-import matplotlib.pyplot as plt
-import seaborn as sns
 from sklearn.metrics import f1_score, precision_score, recall_score
 from sklearn.preprocessing import normalize
 
@@ -577,79 +575,6 @@ class KNNClassifier(object):
         self.n_neighbors = best_k
         return best_k, best_precision
 
-
-
-def plot_section_pair_metric_heatmap(results, metric="recall@10"):
-    """
-    Plot a heatmap showing performance for each (query_section, doc_section) pair
-    using the specified metric (e.g., 'recall@10', 'ndcg@10').
-
-    Assumes results keys are of the form "abstract->claim", etc.
-    """
-    # Collect all query and doc sections
-    query_sections = set()
-    doc_sections = set()
-
-    for key in results.keys():
-        if '->' in key and key != 'abstract->all':  # exclude aggregated key
-            q, d = key.split("->")
-            query_sections.add(q)
-            doc_sections.add(d)
-
-    query_sections = sorted(query_sections)
-    doc_sections = sorted(doc_sections)
-
-    # Fill matrix
-    heatmap_matrix = np.zeros((len(query_sections), len(doc_sections)))
-
-    for i, q in enumerate(query_sections):
-        for j, d in enumerate(doc_sections):
-            key = f"{q}->{d}"
-            if key in results and metric in results[key]:
-                heatmap_matrix[i, j] = results[key][metric]
-
-    # Plot heatmap
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(
-        heatmap_matrix, annot=True, fmt=".2f", cmap="YlGnBu",
-        xticklabels=doc_sections, yticklabels=query_sections
-    )
-    plt.title(f"{metric} across query->document sections")
-    plt.xlabel("Document Section")
-    plt.ylabel("Query Section")
-    plt.tight_layout()
-    plt.show()
-
-
-
-
-
-def plot_retrieved_section_distribution(results, query_section):
-    """
-    Given results from PriorArtEval, plot which sections were retrieved most
-    often for the given query section in the query->all setting.
-    """
-    key = f"{query_section}->all"
-    if key not in results:
-        print(f"[ERROR] Section combination {key} not found in results.")
-        return
-
-    retrieved_sections = results[key].get("retrieved_sections", [])
-    if not retrieved_sections:
-        print(f"[WARNING] No 'retrieved_sections' found in results[{key}].")
-        return
-
-    flat_sections = [sec for query in retrieved_sections for sec in query]  # flatten
-    section_counts = Counter(flat_sections)
-
-    # Plot
-    plt.figure(figsize=(6, 4))
-    sns.barplot(x=list(section_counts.keys()), y=list(section_counts.values()))
-    plt.title(f"Top-K Retrieved Sections for query=[{query_section}]")
-    plt.ylabel("Total Retrieved Count (across all queries)")
-    plt.xlabel("Retrieved Section")
-    plt.tight_layout()
-    plt.show()
 
 
 def analyze_retrieved_sections_integrated(retrieved_sections, query_section="claim", print_results=True):

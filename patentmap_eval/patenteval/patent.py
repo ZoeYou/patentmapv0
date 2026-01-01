@@ -14,7 +14,6 @@ import logging
 import pickle
 
 from patenteval.utils import (
-    cosine,
     load_corpus,
     citation_to_citing_to_cited_dict,
     mean_recall_at_k,
@@ -30,10 +29,10 @@ from patenteval.utils import (
 )
 
 
-from scipy.stats import kendalltau
 
 import pandas as pd
 import numpy as np
+import re
 
 from tqdm import tqdm
 import random
@@ -426,9 +425,11 @@ class IPC_ClassificationEval(object):
             test_dataset.to_csv(test_file_path, index=False)
 
         if type(train_dataset['ipcr_labels'].iloc[0]) == str:
-            # convert string of list into real list
-            train_dataset['ipcr_labels'] = train_dataset['ipcr_labels'].apply(lambda x: [label.strip("' ") for label in x.strip("[]").split(" ") if label])
-            test_dataset['ipcr_labels'] = test_dataset['ipcr_labels'].apply(lambda x: [label.strip("' ") for label in x.strip("[]").split(" ") if label])
+            # Robust parser that handles both space-separated and comma-separated formats
+            # e.g., "['A' 'B' 'C']" or "['A', 'B', 'C']"
+            parse_labels = lambda x: re.findall(r"'([^']+)'", x)
+            train_dataset['ipcr_labels'] = train_dataset['ipcr_labels'].apply(parse_labels)
+            test_dataset['ipcr_labels'] = test_dataset['ipcr_labels'].apply(parse_labels)
         else:   # numpy array
             train_dataset['ipcr_labels'] = train_dataset['ipcr_labels'].apply(lambda x: x.tolist())
             test_dataset['ipcr_labels'] = test_dataset['ipcr_labels'].apply(lambda x: x.tolist())

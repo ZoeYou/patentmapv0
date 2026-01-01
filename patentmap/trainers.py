@@ -1072,7 +1072,7 @@ class CLTrainer(Trainer):
                 params['eval_sample_train'] = 25000
                 params['eval_sample_test'] = 2500
 
-            se = patenteval.engine.SE(params, batcher, prepare)
+            se = patenteval.engine.PE(params, batcher, prepare)
 
             # check if model is on the correct device (e.g., GPU)
             # if not send it to the correct device

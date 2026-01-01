@@ -3,10 +3,15 @@
 evaluate_baselines_inference.py
 
 This script evaluates baseline models (without training) on our patent and scientific evaluation tasks.
-It loads a pretrained model and a pre-tokenized evaluation dataset, then runs evaluation using our custom CLTrainer.
+It loads a pretrained model and computes tokenization and embeddings on-the-fly using the model's tokenizer.
+If precomputed embeddings are present in the expected temp directories, the script will load them to
+speed up repeated runs instead of recomputing embeddings.
+
+When evaluating checkpoint model directories the loader will try to load a tokenizer from the
+checkpoint and (if missing) reconstruct a tokenizer temporarily for evaluation purposes.
+
 Usage example:
-    python evaluate_baselines_inference.py --model_name <path_or_model_id> \
-         --eval_dataset_path ./data/eval_tokenized --output_dir ./results
+    python evaluate_baselines_inference.py --model_name <path_or_model_id> --output_dir ./results
 """
 
 from __future__ import absolute_import, division, unicode_literals
@@ -18,7 +23,6 @@ import json
 import argparse
 import logging
 
-from adapters import AutoAdapterModel
 from tqdm import trange
 import pandas as pd
 import numpy as np
@@ -29,9 +33,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import copy
-from scipy.stats import kendalltau
 
-from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.preprocessing import MultiLabelBinarizer
 from sklearn.model_selection import train_test_split
 
@@ -1553,6 +1555,7 @@ def main():
     
     # Choose the model class based on model name or path
     if args.model_name.lower() in ["allenai/specter2_base", "patentbert"]:
+        from adapters import AutoAdapterModel
         if args.model_name.lower() == "patentbert":
             model_path = "./PatentBert/encoder_only_model"
             tokenizer = AutoTokenizer.from_pretrained(model_path)
@@ -2252,11 +2255,9 @@ def main():
     elif "checkpoint" in args.model_name or "bestmodel":
         def load_checkpoint_model_and_tokenizer(checkpoint_path):
             """Smart checkpoint loader that handles tokenizer and model loading intelligently."""
-            from patentmap.models import BertForCL
             from transformers import AutoConfig, AutoTokenizer
             from dataclasses import dataclass
             from typing import Optional
-            import os, re
             
             @dataclass
             class ModelArguments:
@@ -2265,7 +2266,6 @@ def main():
                 temperature: float = 0.05
                 pooler_type: str = "cls"
                 mlp_only_train: bool = True
-                off_dropout: bool = False
                 model_name_or_path: Optional[str] = None
             
             print(f"🔄 Loading checkpoint: {checkpoint_path}")
