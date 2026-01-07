@@ -266,7 +266,7 @@ def ipc_evaluation(train_embeddings, test_embeddings, train_labels, test_labels,
     ipc_model = LinearClassifier(input_dim=X_train.shape[1], num_classes=y_train.shape[1]).to(device)
 
     # Loss and optimizer
-    criterion = nn.BCEWithLogitsLoss()  # Changed from BCELoss to BCEWithLogitsLoss
+    criterion = nn.BCEWithLogitsLoss()
     optimizer_ipc = optim.Adam(ipc_model.parameters(), lr=3e-4, weight_decay=1e-5)
 
     # Initialize early stopping parameters
@@ -326,33 +326,15 @@ def ipc_evaluation(train_embeddings, test_embeddings, train_labels, test_labels,
         ])
         results[f'precision@{k}'] = precision_at_k * 100
 
-    # Calculate metrics by text type
-    test_labels_np = y_test.cpu().numpy()
-    for text_type in set(test_types):
-        text_type_mask = np.array(test_types) == text_type
-        text_type_labels = test_labels_np[text_type_mask]
-        text_type_probabilities = probs[text_type_mask]
-
-        # Calculate precision@k for this text type
-        for k in [1, 3, 5]:
-            text_type_topk = np.argsort(-text_type_probabilities, axis=1)[:, :k]
-            text_type_precision_at_k = np.mean([
-                len(set(np.where(true == 1)[0]).intersection(pred[:k])) / k
-                for true, pred in zip(text_type_labels, text_type_topk)
-            ])
-            results[f'{text_type}_precision@{k}'] = text_type_precision_at_k * 100
-
     # Format and display results
     print_metric_table(results, "IPC Classification (Linear Probe)")
 
     ########################################################################################################################################################
     # 2. IPC KNN
     knn = KNNClassifier(metric='cosine')
-    X_subtrain, X_val, y_subtrain, y_val = train_test_split(X_train, y_train, test_size=0.1, random_state=42)
-    
-    # Convert tensors to numpy arrays for KNN - remove .astype() to match patent.py
-    X_subtrain_np = X_subtrain.cpu().numpy()
-    y_subtrain_np = y_subtrain.cpu().numpy()
+
+    X_subtrain_np = X_train.cpu().numpy()
+    y_subtrain_np = y_train.cpu().numpy()
     X_val_np = X_val.cpu().numpy()
     y_val_np = y_val.cpu().numpy()
     
@@ -377,23 +359,6 @@ def ipc_evaluation(train_embeddings, test_embeddings, train_labels, test_labels,
             for true, pred_indices in zip(test_labels_np, topk_indices)
         ])
         results[f'precision@{k}'] = precision_at_k * 100
-
-
-    # Calculate per-text-type metrics
-    for text_type in set(test_types):
-        text_type_mask = np.array(test_types) == text_type
-        text_type_labels = test_labels_np[text_type_mask]
-        text_type_probabilities = probabilities[text_type_mask]
-
-        # Calculate precision@k for this text type
-        text_type_pred_topk = np.argsort(-text_type_probabilities, axis=1)
-        for k in [1, 3, 5]:
-            topk_indices = text_type_pred_topk[:, :k]  # Extract top-k indices for each sample
-            text_type_precision_at_k = np.mean([
-                len(set(np.where(true == 1)[0]).intersection(set(pred_indices))) / k
-                for true, pred_indices in zip(text_type_labels, topk_indices)
-            ])
-            results[f'{text_type}_precision@{k}'] = text_type_precision_at_k * 100
 
     # Format and display results
     print_metric_table(results, "IPC Classification (KNN)")

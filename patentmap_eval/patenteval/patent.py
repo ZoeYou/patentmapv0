@@ -711,17 +711,27 @@ class IPC_ClassificationEval(object):
 
         results = {}
         # 1) Train and evaluate the model on abstract section only
-        train_embeddings = torch.tensor(train_embeddings, dtype=torch.float32).to(self.device)
-        train_labels = torch.tensor(train_labels, dtype=torch.float32).to(self.device)
-        test_embeddings = torch.tensor(test_embeddings, dtype=torch.float32).to(self.device)
-        test_labels = torch.tensor(test_labels, dtype=torch.float32).to(self.device)
+        # Filter to abstract section only to avoid data leakage from other sections of the same patent
+        train_abstract_mask = np.array(train_section) == 'abstract'
+        test_abstract_mask = np.array(test_section) == 'abstract'
+        
+        train_embeddings_abstract = train_embeddings[train_abstract_mask]
+        train_labels_abstract = train_labels[train_abstract_mask]
+        test_embeddings_abstract = test_embeddings[test_abstract_mask]
+        test_labels_abstract = test_labels[test_abstract_mask]
+        test_primary_labels_abstract = np.array(test_primary_labels)[test_abstract_mask]
+        
+        logging.info(f"IPC Classification: Using {len(train_embeddings_abstract)} train / {len(test_embeddings_abstract)} test abstracts (filtered from {len(train_embeddings)} / {len(test_embeddings)} total)")
+        
+        train_embeddings_t = torch.tensor(train_embeddings_abstract, dtype=torch.float32).to(self.device)
+        train_labels_t = torch.tensor(train_labels_abstract, dtype=torch.float32).to(self.device)
+        test_embeddings_t = torch.tensor(test_embeddings_abstract, dtype=torch.float32).to(self.device)
+        test_labels_t = torch.tensor(test_labels_abstract, dtype=torch.float32).to(self.device)
 
         # Train and evaluate the model on abstract section only
-        metrics = self.train_evaluate(train_embeddings, train_labels, test_embeddings, test_labels, test_primary_labels)
+        metrics = self.train_evaluate(train_embeddings_t, train_labels_t, test_embeddings_t, test_labels_t, test_primary_labels_abstract)
         results['abstract'] = metrics
         
-        # For compatibility, also store as 'global' (since we're only using abstract)
-        results['global'] = metrics
         # # 2) Train and evaluate the model on each section
         # for section in ["abstract", "claim", "summary", "background", "detailed_description"]:
         #     section_indices = np.where(test_section == section)[0]
@@ -736,6 +746,8 @@ class IPC_ClassificationEval(object):
 
         #     metrics = self.train_evaluate(X_train, y_train, X_test, y_test, primary_true)
         #     results[section] = metrics
+
+        # 
 
         logging.debug('Results: {}'.format(results))
         return results
@@ -804,12 +816,21 @@ class IPC_KNNEval(object):
     def run(self, params, batcher):
         results = {}
 
-        # Train and evaluate the model on abstract section only
-        metrics = self.evaluate_knn(self.train_embeddings, self.train_labels, self.test_embeddings, self.test_labels, self.test_primary_labels)
-        results['abstract'] = metrics
+        # Filter to abstract section only to avoid data leakage from other sections of the same patent
+        train_abstract_mask = np.array(self.train_section) == 'abstract'
+        test_abstract_mask = np.array(self.test_section) == 'abstract'
         
-        # For compatibility, also store as 'global' (since we're only using abstract)
-        results['global'] = metrics
+        train_embeddings = self.train_embeddings[train_abstract_mask]
+        train_labels = self.train_labels[train_abstract_mask]
+        test_embeddings = self.test_embeddings[test_abstract_mask]
+        test_labels = self.test_labels[test_abstract_mask]
+        test_primary_labels = np.array(self.test_primary_labels)[test_abstract_mask]
+        
+        logging.info(f"IPC KNN: Using {len(train_embeddings)} train / {len(test_embeddings)} test abstracts (filtered from {len(self.train_embeddings)} / {len(self.test_embeddings)} total)")
+
+        # Train and evaluate the model on abstract section only
+        metrics = self.evaluate_knn(train_embeddings, train_labels, test_embeddings, test_labels, test_primary_labels)
+        results['abstract'] = metrics
 
         # # 2) Train and evaluate the model on each section
         # section_list = ["abstract", "claim", "summary", "background", "detailed_description"]
