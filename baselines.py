@@ -227,7 +227,25 @@ def cls_pooling(model_output, attention_mask):
     return model_output.last_hidden_state[:, 0]  # Explicitly using last_hidden_state
 
 
-def ipc_evaluation(train_embeddings, test_embeddings, train_labels, test_labels, train_types, test_types):
+def get_encoder_last_hidden_state(model, batch):
+    """Get last_hidden_state from model; for adapter models with a head, use base_model so we get encoder output."""
+    outputs = model(**batch)
+    if hasattr(outputs, 'last_hidden_state'):
+        return outputs.last_hidden_state
+    if isinstance(outputs, dict) and 'last_hidden_state' in outputs:
+        return outputs['last_hidden_state']
+    if hasattr(model, 'base_model'):
+        base_out = model.base_model(**batch)
+        return base_out.last_hidden_state if hasattr(base_out, 'last_hidden_state') else base_out['last_hidden_state']
+    raise KeyError('last_hidden_state')
+
+
+def ipc_evaluation(train_embeddings, test_embeddings, train_labels, test_labels, train_types, test_types,
+                   train_embeddings_knn=None, test_embeddings_knn=None):
+    """
+    train_embeddings, test_embeddings: used for linear probe (and for KNN if KNN-specific embeddings not provided).
+    train_embeddings_knn, test_embeddings_knn: optional; if provided (e.g. SPECTER2 proximity), used for KNN only.
+    """
     # Ensure reproducibility with comprehensive seed setting
     import random
     torch.manual_seed(42)
@@ -330,20 +348,21 @@ def ipc_evaluation(train_embeddings, test_embeddings, train_labels, test_labels,
     print_metric_table(results, "IPC Classification (Linear Probe)")
 
     ########################################################################################################################################################
-    # 2. IPC KNN
+    # 2. IPC KNN (nearest-neighbor in embedding space; use proximity embeddings when provided, e.g. SPECTER2)
+    knn_train = train_embeddings_knn if train_embeddings_knn is not None else train_embeddings
+    knn_test = test_embeddings_knn if test_embeddings_knn is not None else test_embeddings
+
     knn = KNNClassifier(metric='cosine')
 
-    X_subtrain_np = X_train.cpu().numpy()
-    y_subtrain_np = y_train.cpu().numpy()
-    X_val_np = X_val.cpu().numpy()
-    y_val_np = y_val.cpu().numpy()
-    
-    best_k, _ = knn.tune_k_by_precision_at_k(X_subtrain_np, y_subtrain_np, X_val_np, y_val_np, candidate_k_list=[1, 3, 5, 10])
+    X_subtrain_knn, X_val_knn, y_subtrain_knn, y_val_knn = train_test_split(
+        knn_train, train_labels, test_size=0.1, random_state=42
+    )
+    best_k, _ = knn.tune_k_by_precision_at_k(X_subtrain_knn, y_subtrain_knn, X_val_knn, y_val_knn, candidate_k_list=[1, 3, 5, 10])
 
     knn.n_neighbors = best_k
-    knn.fit(train_embeddings, train_labels)
+    knn.fit(knn_train, train_labels)
 
-    probabilities = knn.predict_proba(test_embeddings)
+    probabilities = knn.predict_proba(knn_test)
 
     # Compute evaluation metrics
     test_labels_np = test_labels
@@ -1406,6 +1425,10 @@ def main():
     model_basename = args.model_name.strip("/").split("/")[-1]
     IPC_dir_temp = os.path.join(args.output_dir, f'IPC-Classification_temp_{model_basename}')
     priorart_temp_dir = os.path.join(args.output_dir, f'priorart_temp_{model_basename}')
+    # SPECTER2: use format-specific adapters; IPC uses classification adapter → separate cache
+    if "specter2" in model_basename.lower():
+        IPC_dir_temp = os.path.join(args.output_dir, f'IPC-Classification_temp_{model_basename}_clf')
+        priorart_temp_dir = os.path.join(args.output_dir, f'priorart_temp_{model_basename}_prx')
     
     # Create directories if they don't exist (for non-BM25 models)
     if not ("bm25" in args.model_name):
@@ -1522,18 +1545,24 @@ def main():
     if args.model_name.lower() in ["allenai/specter2_base", "patentbert"]:
         from adapters import AutoAdapterModel
         if args.model_name.lower() == "patentbert":
-            model_path = "./PatentBert/encoder_only_model"
+            model_path = "ZoeYou/patentbert-pytorch"
             tokenizer = AutoTokenizer.from_pretrained(model_path)
             model = AutoAdapterModel.from_pretrained(model_path)
         else:
             # load the model and tokenizer
             tokenizer = AutoTokenizer.from_pretrained(args.model_name)
             model = AutoAdapterModel.from_pretrained(args.model_name)
-            #load the adapter(s) as per the required task, provide an identifier for the adapter in load_as argument and activate it
+            # SPECTER2: load format-specific adapters (see https://huggingface.co/allenai/specter2)
+            # proximity (specter2): encode queries and documents for prior-art search.
+            # classification (specter2_classification): IPC linear probe.
             model.load_adapter("allenai/specter2", source="hf", load_as="specter2", set_active=True)
+            model.load_adapter("allenai/specter2_classification", source="hf", load_as="specter2_classification")
         embedding_dim = model.config.hidden_size
         model.to(device)
         ############################### IPC classification evaluation ###############################
+        # SPECTER2: use classification adapter for IPC (format-specific; best for linear classifiers)
+        if args.model_name.lower() == "allenai/specter2_base":
+            model.set_active_adapters("specter2_classification")
         # check if the embeddings are already created
         if os.path.exists(f'{IPC_dir_temp}/train_embeddings.pt') and os.path.exists(f'{IPC_dir_temp}/test_embeddings.pt'):
             print("Embeddings already created!")
@@ -1549,24 +1578,24 @@ def main():
             test_texts = test_dataset['text'].apply(lambda x: re.sub(r'\[(?:abstract|claim|summary|invention|drawing|description)\] ', '', x).replace('[SEP]', tokenizer.sep_token))   
 
             # tokenize the texts
-            train_encodings = tokenizer(train_texts.tolist(), truncation=True, padding=True, max_length=512, return_tensors='pt')
-            test_encodings = tokenizer(test_texts.tolist(), truncation=True, padding=True, max_length=512, return_tensors='pt')
+            train_encodings = tokenizer(train_texts.tolist(), truncation=True, padding=True, max_length=512, return_tensors='pt', return_token_type_ids=False)
+            test_encodings = tokenizer(test_texts.tolist(), truncation=True, padding=True, max_length=512, return_tensors='pt', return_token_type_ids=False)
 
             # get the embeddings by batch
-            batch_size = 256
+            batch_size = 128
             train_embeddings = np.zeros((len(train_encodings['input_ids']), embedding_dim))
             test_embeddings = np.zeros((len(test_encodings['input_ids']), embedding_dim))
 
             with torch.no_grad():
                 for i in trange(0, len(train_encodings['input_ids']), batch_size, desc="Computing train embeddings"):
                     batch = {key: val[i:i+batch_size].to(device) for key, val in train_encodings.items()}
-                    outputs = model(**batch)
-                    train_embeddings[i:i+batch_size] = outputs['last_hidden_state'][:, 0, :].detach().cpu().numpy()
+                    last_h = get_encoder_last_hidden_state(model, batch)
+                    train_embeddings[i:i+batch_size] = last_h[:, 0, :].detach().cpu().numpy()
 
                 for i in trange(0, len(test_encodings['input_ids']), batch_size, desc="Computing test embeddings"):
                     batch = {key: val[i:i+batch_size].to(device) for key, val in test_encodings.items()}
-                    outputs = model(**batch)
-                    test_embeddings[i:i+batch_size] = outputs['last_hidden_state'][:, 0, :].detach().cpu().numpy()
+                    last_h = get_encoder_last_hidden_state(model, batch)
+                    test_embeddings[i:i+batch_size] = last_h[:, 0, :].detach().cpu().numpy()
 
             log_embeddings_shape({
                 'train_embeddings': train_embeddings, 
@@ -1577,9 +1606,36 @@ def main():
             torch.save(train_embeddings, f'{IPC_dir_temp}/train_embeddings.pt', pickle_protocol=4)
             torch.save(test_embeddings, f'{IPC_dir_temp}/test_embeddings.pt', pickle_protocol=4)
 
-        ipc_evaluation(train_embeddings, test_embeddings, train_labels, test_labels, train_types, test_types)
+            # SPECTER2: compute proximity (PRX) embeddings for IPC KNN (nearest-neighbor uses PRX adapter)
+            if args.model_name.lower() == "allenai/specter2_base":
+                model.set_active_adapters("specter2")
+                train_embeddings_prx = np.zeros((len(train_encodings['input_ids']), embedding_dim))
+                test_embeddings_prx = np.zeros((len(test_encodings['input_ids']), embedding_dim))
+                with torch.no_grad():
+                    for i in trange(0, len(train_encodings['input_ids']), batch_size, desc="Computing train embeddings (PRX for KNN)"):
+                        batch = {key: val[i:i+batch_size].to(device) for key, val in train_encodings.items()}
+                        last_h = get_encoder_last_hidden_state(model, batch)
+                        train_embeddings_prx[i:i+batch_size] = last_h[:, 0, :].detach().cpu().numpy()
+                    for i in trange(0, len(test_encodings['input_ids']), batch_size, desc="Computing test embeddings (PRX for KNN)"):
+                        batch = {key: val[i:i+batch_size].to(device) for key, val in test_encodings.items()}
+                        last_h = get_encoder_last_hidden_state(model, batch)
+                        test_embeddings_prx[i:i+batch_size] = last_h[:, 0, :].detach().cpu().numpy()
+                torch.save(train_embeddings_prx, f'{IPC_dir_temp}/train_embeddings_prx.pt', pickle_protocol=4)
+                torch.save(test_embeddings_prx, f'{IPC_dir_temp}/test_embeddings_prx.pt', pickle_protocol=4)
+
+        # SPECTER2: use proximity embeddings for KNN (linear probe uses CLF embeddings already in train/test_embeddings)
+        train_embeddings_knn = None
+        test_embeddings_knn = None
+        if args.model_name.lower() == "allenai/specter2_base":
+            if os.path.exists(f'{IPC_dir_temp}/train_embeddings_prx.pt') and os.path.exists(f'{IPC_dir_temp}/test_embeddings_prx.pt'):
+                train_embeddings_knn = torch.load(f'{IPC_dir_temp}/train_embeddings_prx.pt', weights_only=False)
+                test_embeddings_knn = torch.load(f'{IPC_dir_temp}/test_embeddings_prx.pt', weights_only=False)
+
+        ipc_evaluation(train_embeddings, test_embeddings, train_labels, test_labels, train_types, test_types,
+                       train_embeddings_knn=train_embeddings_knn, test_embeddings_knn=test_embeddings_knn)
 
         ############################ Prior-art Search evaluation ############################
+        # SPECTER2: use proximity (specter2) adapter for both queries and documents
         # check if the embeddings are already created
         if os.path.exists(f'{priorart_temp_dir}/query_embeddings.pt') and os.path.exists(f'{priorart_temp_dir}/document_embeddings.pt'):
             print("Embeddings already created!")
@@ -1593,32 +1649,35 @@ def main():
             
             # Process each text type separately, exactly like patent.py
             for texttype in ["abstract", "claim", "invention"]:
-                # Specter2 and PatentBERT don't use section tokens - clean format
+                # SPECTER2/PatentBERT: title + sep + abstract (no section tokens); official format: title + sep_token + (abstract or '')
                 if texttype == "abstract":
-                    query_texts = [queries_df.iloc[i]['title'] + f" {tokenizer.sep_token} " + queries_df.iloc[i][texttype] for i in range(len(queries_df))]
-                    doc_texts = [documents_df.iloc[i]['title'] + f" {tokenizer.sep_token} " + documents_df.iloc[i][texttype] for i in range(len(documents_df))]
+                    query_texts = [queries_df.iloc[i]['title'] + f" {tokenizer.sep_token} " + (queries_df.iloc[i][texttype] or '') for i in range(len(queries_df))]
+                    doc_texts = [documents_df.iloc[i]['title'] + f" {tokenizer.sep_token} " + (documents_df.iloc[i][texttype] or '') for i in range(len(documents_df))]
                 else:
                     query_texts = [queries_df.iloc[i][texttype] for i in range(len(queries_df))]
                     doc_texts = [documents_df.iloc[i][texttype] for i in range(len(documents_df))]
 
-                query_encodings = tokenizer(query_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
-                doc_encodings = tokenizer(doc_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
+                query_encodings = tokenizer(query_texts, truncation=True, padding=True, max_length=512, return_tensors='pt', return_token_type_ids=False)
+                doc_encodings = tokenizer(doc_texts, truncation=True, padding=True, max_length=512, return_tensors='pt', return_token_type_ids=False)
 
                 # get the embeddings by batch
-                batch_size = 256
+                batch_size = 128
                 query_embs = np.zeros((len(query_encodings['input_ids']), embedding_dim))
                 doc_embs = np.zeros((len(doc_encodings['input_ids']), embedding_dim))
 
                 with torch.no_grad():
+                    # SPECTER2: use proximity adapter for both queries and documents
+                    if args.model_name.lower() == "allenai/specter2_base":
+                        model.set_active_adapters("specter2")
                     for i in trange(0, len(query_encodings['input_ids']), batch_size, desc=f"Computing {texttype} query embeddings"):
                         batch = {key: val[i:i+batch_size].to(device) for key, val in query_encodings.items()}
-                        outputs = model(**batch)
-                        query_embs[i:i+batch_size] = outputs['last_hidden_state'][:, 0, :].detach().cpu().numpy()
+                        last_h = get_encoder_last_hidden_state(model, batch)
+                        query_embs[i:i+batch_size] = last_h[:, 0, :].detach().cpu().numpy()
 
                     for i in trange(0, len(doc_encodings['input_ids']), batch_size, desc=f"Computing {texttype} document embeddings"):
                         batch = {key: val[i:i+batch_size].to(device) for key, val in doc_encodings.items()}
-                        outputs = model(**batch)
-                        doc_embs[i:i+batch_size] = outputs['last_hidden_state'][:, 0, :].detach().cpu().numpy()
+                        last_h = get_encoder_last_hidden_state(model, batch)
+                        doc_embs[i:i+batch_size] = last_h[:, 0, :].detach().cpu().numpy()
                 
                 # Store embeddings by text type
                 query_embeddings_dict[texttype] = query_embs

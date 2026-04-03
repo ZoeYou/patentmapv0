@@ -941,7 +941,8 @@ class CLTrainer(Trainer):
             model.swav_head.update_ema()
             
         if self.is_world_process_zero():
-            logs = {'loss': loss.item()}
+            loss_val = loss.mean().item() if loss.numel() > 1 else loss.item()
+            logs = {'loss': loss_val}
 
             # Track InfoNCE contrastive loss separately
             if hasattr(outputs, "contrastive_loss") and outputs.contrastive_loss is not None:

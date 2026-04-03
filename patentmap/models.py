@@ -830,7 +830,10 @@ def cl_forward(
                 # Add to final loss
                 final_loss += cls.model_args.mlm_weight * masked_lm_loss
 
-    # Return results
+    # Return results: ensure loss is always a scalar (e.g. for DDP/DeepSpeed)
+    if final_loss.numel() > 1:
+        final_loss = final_loss.mean()
+
     if not return_dict:
         return (final_loss,)
 
@@ -988,6 +991,20 @@ class BertForCL(BertPreTrainedModel):
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
             )
+        # For inference: if input_ids is 2D [B, L], return raw encoder outputs
+        elif input_ids is not None and input_ids.dim() == 2:
+            return self.bert(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+                position_ids=position_ids,
+                head_mask=head_mask,
+                inputs_embeds=inputs_embeds,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+            )
+        # For training: input_ids is 3D [B, 2, L] for contrastive learning
         else:
             return cl_forward(self, self.bert,
                 input_ids=input_ids,
