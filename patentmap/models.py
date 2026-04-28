@@ -535,12 +535,75 @@ def cl_forward(
         
         return pooled
 
+    # ----- stash for fused MLM hidden states (set inside standard branch) -----
+    fused_mlm_hidden = None   # [N, L, H] hidden states for MLM views (post-encoder)
+    fused_mlm_labels = None   # [N, L] labels aligned with fused_mlm_hidden
+
     # Strategy 1: Standard SimCSE-style with dropout for both views
     if need_dropout is None or need_dropout.all():
-        # Both views use dropout (standard SimCSE)
-        z_both_views = _encode_with_dropout_control(flat_ids, flat_attn, flat_tok, use_dropout=True, custom_dropout_rate=dropout_rate)
-        z_both_views = z_both_views.view(B, 2, -1)  # [B, 2, D]
-        z1, z2 = z_both_views[:, 0], z_both_views[:, 1]  # [B, D] each
+        # when MLM is enabled, fuse the MLM encoder forward into the CL forward
+        # by concatenating MLM views (those with at least one valid label) onto flat_ids
+        # and running a single encoder pass. Falls back to two passes only if no MLM views
+        # have valid labels, or if a custom dropout_rate is requested (which needs the helper).
+        fuse_mlm = (
+            cls.model_args.do_mlm
+            and mlm_input_ids is not None
+            and mlm_labels is not None
+            and dropout_rate is None
+        )
+        if fuse_mlm:
+            mlm_ids_2b = mlm_input_ids.view(-1, L)        # [2B, L]
+            mlm_lbl_2b = mlm_labels.view(-1, L)           # [2B, L]
+            view_mask = (mlm_lbl_2b != -100).any(dim=1)   # [2B] - which views have any masked token
+            if view_mask.any():
+                extra_ids = mlm_ids_2b[view_mask]
+                extra_attn = flat_attn[view_mask]
+                extra_tok = flat_tok[view_mask] if flat_tok is not None else None
+
+                combined_ids = torch.cat([flat_ids, extra_ids], dim=0)
+                combined_attn = torch.cat([flat_attn, extra_attn], dim=0)
+                combined_tok = (
+                    torch.cat([flat_tok, extra_tok], dim=0) if flat_tok is not None else None
+                )
+
+                encoder.train()  # dropout ON (matches original CL + MLM behavior)
+                outputs_all = encoder(
+                    input_ids=combined_ids,
+                    attention_mask=combined_attn,
+                    token_type_ids=combined_tok,
+                    output_hidden_states=need_hs,
+                    return_dict=True,
+                )
+
+                twoB = flat_ids.size(0)
+
+                # Slice CL portion and run pooler manually (mirrors _encode_with_dropout_control tail)
+                class _SlicedOutputs:
+                    pass
+                cl_out = _SlicedOutputs()
+                cl_out.last_hidden_state = outputs_all.last_hidden_state[:twoB]
+                cl_out.hidden_states = (
+                    tuple(h[:twoB] for h in outputs_all.hidden_states)
+                    if (need_hs and getattr(outputs_all, "hidden_states", None) is not None)
+                    else None
+                )
+                pooled = cls.pooler(flat_attn, cl_out)
+                if cls.pooler_type == "cls":
+                    pooled = cls.mlp(pooled)
+                z_both_views = pooled.view(B, 2, -1)
+                z1, z2 = z_both_views[:, 0], z_both_views[:, 1]
+
+                # Stash MLM-portion hidden states + labels for the MLM block below
+                fused_mlm_hidden = outputs_all.last_hidden_state[twoB:]   # [N, L, H]
+                fused_mlm_labels = mlm_lbl_2b[view_mask]                  # [N, L]
+            else:
+                fuse_mlm = False
+
+        if not fuse_mlm:
+            # Both views use dropout (standard SimCSE)
+            z_both_views = _encode_with_dropout_control(flat_ids, flat_attn, flat_tok, use_dropout=True, custom_dropout_rate=dropout_rate)
+            z_both_views = z_both_views.view(B, 2, -1)  # [B, 2, D]
+            z1, z2 = z_both_views[:, 0], z_both_views[:, 1]  # [B, D] each
     else:
         # Mixed strategy: some samples need dropout, others have pre-augmented data
         # Split samples based on need_dropout flag
@@ -729,15 +792,36 @@ def cl_forward(
     # ------------------------- MLM Loss (Memory-Optimized Strategy) -------------------------
     masked_lm_loss = None
     if cls.model_args.do_mlm and mlm_input_ids is not None and mlm_labels is not None:
+        # ----- reuse hidden states from fused encoder forward -----
+        if fused_mlm_hidden is not None and fused_mlm_labels is not None:
+            mlm_lbl_flat = fused_mlm_labels.reshape(-1)             # [N*L]
+            mask_idx = mlm_lbl_flat != -100
+            if mask_idx.sum() > 0:
+                hs_flat = fused_mlm_hidden.reshape(-1, fused_mlm_hidden.size(-1))  # [N*L, H]
+                pred_scores = cls.lm_head(hs_flat[mask_idx])
+                loss_fct = nn.CrossEntropyLoss()
+                masked_lm_loss = loss_fct(pred_scores, mlm_lbl_flat[mask_idx])
+
+                if dist_on:
+                    dist.all_reduce(masked_lm_loss, op=dist.ReduceOp.SUM)
+                    masked_lm_loss /= world_sz
+
+                final_loss += cls.model_args.mlm_weight * masked_lm_loss
+
+            # Skip the legacy chunked MLM forward below
+            goto_skip_legacy_mlm = True
+        else:
+            goto_skip_legacy_mlm = False
+
         # MLM strategy is controlled by data collator, but we handle the computation here
         # The collator ensures that only relevant views have valid labels (!= -100)
         
         # Count valid MLM positions across all views
         valid_mlm_positions = (mlm_labels != -100).sum()
         
-        if valid_mlm_positions > 0:
-            # Memory optimization: process MLM in smaller chunks to reduce peak memory usage
-            chunk_size = min(B, 8)  # Process maximum 8 samples at a time
+        if not goto_skip_legacy_mlm and valid_mlm_positions > 0:
+            # Process MLM with full batch at once (no chunking to reduce loop overhead)
+            chunk_size = B * 2  # Process entire batch in one go
             total_mlm_loss = 0.0
             total_chunks = 0
             

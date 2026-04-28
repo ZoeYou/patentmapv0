@@ -469,10 +469,6 @@ class OurTrainingArguments(TrainingArguments):
         default=4,
         metadata={"help": "Maximum number of batches to use for diagnostic computation."}
     )
-    diagnostic_tau: float = field(
-        default=0.05,
-        metadata={"help": "Temperature parameter for diagnostic negative entropy computation."}
-    )
     diagnostic_probe_size: int = field(
         default=2000,
         metadata={"help": "Number of samples to use for diagnostic probe dataset."}
@@ -1301,7 +1297,6 @@ def main():
         enable_diagnostics=training_args.enable_diagnostics,
         diagnostic_log_every=training_args.diagnostic_log_every,
         diagnostic_max_batches=training_args.diagnostic_max_batches,
-        diagnostic_tau=training_args.diagnostic_tau,
     )
 
     eval_callback = EvaluateAtLogarithmicStepsCallback(tolerance=1e-3)

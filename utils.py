@@ -79,12 +79,12 @@ class EvaluateAtLogarithmicStepsCallback(TrainerCallback):
         This function is called at the end of each training step for controling the evaluation steps.
         """
         step = state.global_step
-        if step < 128:
-            log_step = math.log(step, 4)
+        if step < 512:
+            log_step = math.log(step, 8)
             if abs(round(log_step) - log_step) < self.tolerance:
                 control.should_evaluate = True
         else:
-            if step % 125 == 0:
+            if step % 500 == 0:
                 control.should_evaluate = True
         return control
 
