@@ -949,7 +949,7 @@ class CLTrainer(Trainer):
                 logs['contrastive_loss'] = outputs.contrastive_loss.item()
 
             # if MLM training
-            if self.model_args.regularization == "mlm" and hasattr(outputs, "loss_MLM") and outputs.loss_MLM is not None:
+            if self.model_args.do_mlm and hasattr(outputs, "loss_MLM") and outputs.loss_MLM is not None:
                 logs['mlm_loss'] = outputs.loss_MLM.item()
 
             # Track losses for different regularization methods

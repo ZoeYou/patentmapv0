@@ -447,9 +447,10 @@ def compute_uniformity(embeddings, t=2.0, num_samples=10000, device='cuda'):
     
     N = embeddings.shape[0]
     
-    # Randomly sample pairs of indices
-    idx1 = np.random.randint(0, N, size=num_samples)
-    idx2 = np.random.randint(0, N, size=num_samples)
+    # Randomly sample pairs of indices (fixed seed for reproducibility)
+    rng = np.random.RandomState(42)
+    idx1 = rng.randint(0, N, size=num_samples)
+    idx2 = rng.randint(0, N, size=num_samples)
     
     # Compute distances for the sampled pairs
     diffs = embeddings[idx1] - embeddings[idx2]

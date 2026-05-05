@@ -820,8 +820,10 @@ def cl_forward(
         valid_mlm_positions = (mlm_labels != -100).sum()
         
         if not goto_skip_legacy_mlm and valid_mlm_positions > 0:
-            # Process MLM with full batch at once (no chunking to reduce loop overhead)
-            chunk_size = B * 2  # Process entire batch in one go
+            # Process MLM in moderately-sized chunks: large enough to avoid Python loop
+            # overhead, small enough to fit alongside the CL forward activations.
+            # chunk=64 over 2B=1024 -> only 16 iterations (vs 128 with chunk=8).
+            chunk_size = min(B * 2, 64)
             total_mlm_loss = 0.0
             total_chunks = 0
             

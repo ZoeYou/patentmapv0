@@ -23,7 +23,6 @@ import dataclasses
 
 
 from datasets import Dataset
-from torch.utils.data import IterableDataset, Dataset as TorchDataset
 from collections import defaultdict
 
 import transformers

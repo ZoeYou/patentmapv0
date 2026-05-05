@@ -203,14 +203,14 @@ deepspeed --num_gpus=1 train.py \
 
 ## Evaluation
 
-The `baselines.py` script evaluates pretrained models on various patent-specific tasks without additional training.
+The `evaluate.py` script evaluates pretrained models on various patent-specific tasks without additional training.
 
 ### Evaluate a Pretrained Model
 
 To evaluate any pretrained model (e.g., from HuggingFace or a local checkpoint):
 
 ```bash
-python baselines.py \
+python evaluate.py \
     --model_name anferico/bert-for-patents \
     --output_dir ./baseline_results
 ```
@@ -220,7 +220,7 @@ python baselines.py \
 After training with `train.py`, evaluate your model:
 
 ```bash
-python baselines.py \
+python evaluate.py \
     --model_name ./results/checkpoint-final \
     --output_dir ./evaluation_results
 ```
@@ -250,7 +250,7 @@ Results are saved in the specified output directory with detailed metrics for ea
 ```
 patentmapv0/
 ├── train.py              # Main training script
-├── baselines.py           # Baseline evaluation script
+├── evaluate.py            # Evaluation script
 ├── utils.py              # Utility functions
 ├── run_example.sh        # Example training script
 ├── requirements.txt      # Python dependencies
