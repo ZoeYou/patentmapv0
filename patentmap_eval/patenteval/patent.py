@@ -16,7 +16,12 @@ import pickle
 from patenteval.utils import (
     load_corpus,
     citation_to_citing_to_cited_dict,
+    citation_to_citing_to_cited_graded_dict,
     mean_recall_at_k,
+    mean_ndcg_at_k,
+    mean_ndcg_at_k_graded,
+    mean_average_precision,
+    mean_reciprocal_rank,
     label_process,
     compute_uniformity,
     compute_alignment,
@@ -93,8 +98,10 @@ class PriorArtEval(object):
         citation_file = f"{fpath}/mapping/gold.json"
         with open(citation_file) as f:
             raw_citations = json.load(f)
-        # Expect something like {query_id: [list_of_cited_doc_ids], ...}
+        # Binary mapping: {query_id: [list_of_cited_doc_ids], ...}
         self.citation_mapping = citation_to_citing_to_cited_dict(raw_citations)
+        # Graded mapping: {query_id: {cited_doc_id: gain}}, gains X=3, Y=2, A=1.
+        self.citation_mapping_graded = citation_to_citing_to_cited_graded_dict(raw_citations)
 
     def do_prepare(self, params, prepare):
         """
@@ -219,114 +226,134 @@ class PriorArtEval(object):
         np.save(os.path.join(embedding_path, 'doc_ids.npy'), doc_ids)
 
 
-        # 2) For each texttype1 (query) vs texttype2 (doc), compute retrieval
+        # 2) abstract->abstract retrieval (single pair, mirrors evaluate.py prior_art_search_evaluation).
         results = {}
-        for texttype_q in ["abstract", "claim", "invention"]:
-            for texttype_d in ["abstract", "claim", "invention"]:
-                Q_emb = query_embeddings[texttype_q].astype(np.float32)  # shape [num_queries, emb_dim]
-                D_emb = doc_embeddings[texttype_d].astype(np.float32)    # shape [num_docs, emb_dim]
+        texttype_q = "abstract"
+        texttype_d = "abstract"
 
-                # Validate shape consistency
-                if Q_emb.shape[1] != D_emb.shape[1]:
-                    logging.warning(f"Embedding dimension mismatch: Q_emb {Q_emb.shape} vs D_emb {D_emb.shape}")
-                    continue
+        Q_emb = query_embeddings[texttype_q].astype(np.float32)
+        D_emb = doc_embeddings[texttype_d].astype(np.float32)
 
-                if np.any(np.isnan(Q_emb)) or np.any(np.isnan(D_emb)):
-                    raise ValueError("NaN detected in embeddings before normalization.")
+        if Q_emb.shape[1] != D_emb.shape[1]:
+            logging.warning(f"Embedding dimension mismatch: Q_emb {Q_emb.shape} vs D_emb {D_emb.shape}")
+        if np.any(np.isnan(Q_emb)) or np.any(np.isnan(D_emb)):
+            raise ValueError("NaN detected in embeddings before normalization.")
 
-                # Create copies to avoid modifying original data
-                Q_emb_norm = Q_emb.copy()
-                D_emb_norm = D_emb.copy()
-                
-                faiss.normalize_L2(Q_emb_norm)  # Normalize before similarity computation
-                faiss.normalize_L2(D_emb_norm)
-                distances = Q_emb_norm @ D_emb_norm.T  # FAISS optimized cosine similarity
+        Q_emb_norm = Q_emb.copy()
+        D_emb_norm = D_emb.copy()
+        faiss.normalize_L2(Q_emb_norm)
+        faiss.normalize_L2(D_emb_norm)
+        distances = Q_emb_norm @ D_emb_norm.T
 
-                # Validate distance matrix shape
-                expected_shape = (len(query_ids), len(doc_ids))
-                if distances.shape != expected_shape:
-                    logging.warning(f"Distance matrix shape {distances.shape} != expected {expected_shape}")
-                    continue
+        # Full ranking with stable tie-break for determinism.
+        top_k_indices = np.argsort(-distances, axis=1, kind='stable')
 
-                # For each query row, we get top_k doc indices (sorted ascending by distance)
-                top_k_indices = np.argsort(-distances, axis=1)[:, :top_k]
+        d_ids_arr = np.asarray(doc_ids)
+        true_labels_list, predicted_labels_list = [], []
+        true_graded_list = []
+        for q_idx, retrieved_docs_indices in enumerate(top_k_indices):
+            q_id_str = query_ids[q_idx]
+            true_labels = self.citation_mapping.get(q_id_str, [])
+            predicted_labels = d_ids_arr[retrieved_docs_indices].tolist()
+            true_labels_list.append(true_labels)
+            predicted_labels_list.append(predicted_labels)
+            true_graded_list.append(self.citation_mapping_graded.get(q_id_str, {}))
 
-                # Evaluate retrieval: we build lists of true labels & predicted labels
-                true_labels_list, predicted_labels_list = [], []
+        results_key = f"{texttype_q}->{texttype_d}"
+        results[results_key] = {
+            'recall@10':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=10),
+            'recall@20':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=20),
+            'recall@50':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=50),
+            'recall@100': mean_recall_at_k(true_labels_list, predicted_labels_list, k=100),
 
-                # We'll iterate over each query index
-                for q_idx, retrieved_docs_indices in enumerate(top_k_indices):
-                    # 1) The query ID string, e.g. 'Q1'
-                    q_id_str = query_ids[q_idx]
-                    # 2) The set of true doc IDs for that query, e.g. ['D3', 'D27']
-                    #    Make sure your citation_mapping stores them as a set/list
-                    true_labels = self.citation_mapping.get(q_id_str, [])
+            'ndcg@10':  mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=10),
+            'ndcg@20':  mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=20),
+            'ndcg@50':  mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=50),
+            'ndcg@100': mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=100),
 
-                    # 3) Convert doc indices to doc ID strings
-                    predicted_labels = [doc_ids[d_idx] for d_idx in retrieved_docs_indices]
+            'ndcg_graded@10':  mean_ndcg_at_k_graded(true_graded_list, predicted_labels_list, k=10),
+            'ndcg_graded@20':  mean_ndcg_at_k_graded(true_graded_list, predicted_labels_list, k=20),
+            'ndcg_graded@50':  mean_ndcg_at_k_graded(true_graded_list, predicted_labels_list, k=50),
+            'ndcg_graded@100': mean_ndcg_at_k_graded(true_graded_list, predicted_labels_list, k=100),
 
-                    true_labels_list.append(true_labels)
-                    predicted_labels_list.append(predicted_labels)
+            # MAP/MRR over the full ranking (predicted_labels_list contains all docs).
+            'map':  mean_average_precision(true_labels_list, predicted_labels_list),
+            'mrr':  mean_reciprocal_rank(true_labels_list, predicted_labels_list),
+        }
 
-                # Compute recall@k
-                results_key = f"{texttype_q}->{texttype_d}"
-                results[results_key] = {
-                    'recall@10':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=10),
-                    'recall@20':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=20),
-                    'recall@50':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=50),
-                    'recall@100': mean_recall_at_k(true_labels_list, predicted_labels_list, k=100),
-                }
+        # 3) claim->all (max-sim aggregation across sections), mirrors evaluate.py.
+        query_texttype = "claim"
+        section_names = ["abstract", "claim", "invention"]
+        n_sections = len(section_names)
+        original_doc_count = len(doc_ids)
 
-        # 3) compute performance for query -> all sections
-        for texttype_q in ["abstract", "claim", "invention"]:
-            retrieved_sections = []   # for noting which section is retrieved at top_k
-            Q_emb = query_embeddings[texttype_q].astype(np.float32)
-            D_emb = np.concatenate([doc_embeddings[tt].astype(np.float32) for tt in ["abstract", "claim", "invention"]], axis=0)
-            D_ids = np.concatenate([np.array(doc_ids) for _ in ["abstract", "claim", "invention"]], axis=0)
+        Q_emb = query_embeddings[query_texttype].astype(np.float32)
+        # Concatenate doc embeddings as [abstracts | claims | inventions], length n_sections * n_docs.
+        D_emb = np.concatenate(
+            [doc_embeddings[tt].astype(np.float32) for tt in section_names], axis=0
+        )
 
-            if np.any(np.isnan(Q_emb)) or np.any(np.isnan(D_emb)):
-                raise ValueError("NaN detected in embeddings before normalization.")
-            
-            faiss.normalize_L2(Q_emb)
-            faiss.normalize_L2(D_emb)
-            distances = Q_emb @ D_emb.T
+        if np.any(np.isnan(Q_emb)) or np.any(np.isnan(D_emb)):
+            raise ValueError("NaN detected in embeddings before normalization.")
+        faiss.normalize_L2(Q_emb)
+        faiss.normalize_L2(D_emb)
+        distances = Q_emb @ D_emb.T  # (n_q, n_sections * n_docs)
 
-            top_k_indices = np.argsort(-distances, axis=1)[:, :top_k * 3]  # top_k * 3 to ensure we have enough candidates
+        # Reshape to (n_q, n_sections, n_docs) and take max over sections per (query, doc).
+        distances_3d = distances.reshape(Q_emb.shape[0], n_sections, original_doc_count)
+        max_sim_per_doc = distances_3d.max(axis=1)
+        best_section_per_doc = distances_3d.argmax(axis=1)
 
-            true_labels_list, predicted_labels_list = [], []
-            for q_idx, retrieved_docs_indices in enumerate(top_k_indices):
-                q_id_str = query_ids[q_idx]
-                true_labels = self.citation_mapping.get(q_id_str, [])
-                predicted_labels = [D_ids[d_idx] for d_idx in retrieved_docs_indices]
+        full_ranking = np.argsort(-max_sim_per_doc, axis=1, kind='stable')
+        top_k_arr = full_ranking[:, :top_k]
 
-                # Filter out duplicates in predicted_labels without changing order
-                _, unique_indices = np.unique(predicted_labels, return_index=True)
-                predicted_labels = [predicted_labels[i] for i in sorted(unique_indices)][:top_k]
-                retrieved_sections.append([
-                    ["abstract", "claim", "invention"][retrieved_docs_indices[i] // len(doc_ids)] 
-                    for i in sorted(unique_indices)[:top_k]
-                ])
+        original_doc_ids_arr = np.asarray(doc_ids)
 
-                true_labels_list.append(true_labels)
-                predicted_labels_list.append(predicted_labels)
+        retrieved_sections = []
+        true_labels_list = []
+        predicted_labels_top100 = []
+        predicted_labels_full = []
+        true_graded_list = []
+        for q_idx, retrieved_docs_indices in enumerate(top_k_arr):
+            q_id_str = query_ids[q_idx]
+            true_labels = self.citation_mapping.get(q_id_str, [])
+            retrieved_sections.append([
+                section_names[best_section_per_doc[q_idx, d_idx]]
+                for d_idx in retrieved_docs_indices
+            ])
+            true_labels_list.append(true_labels)
+            predicted_labels_top100.append(original_doc_ids_arr[retrieved_docs_indices].tolist())
+            predicted_labels_full.append(original_doc_ids_arr[full_ranking[q_idx]].tolist())
+            true_graded_list.append(self.citation_mapping_graded.get(q_id_str, {}))
 
-            results_key = f"{texttype_q}->all"
-            results[results_key] = {
-                'recall@10':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=10),
-                'recall@20':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=20),
-                'recall@50':  mean_recall_at_k(true_labels_list, predicted_labels_list, k=50),
-                'recall@100': mean_recall_at_k(true_labels_list, predicted_labels_list, k=100),
+        results_key = f"{query_texttype}->all"
+        results[results_key] = {
+            'recall@10':  mean_recall_at_k(true_labels_list, predicted_labels_top100, k=10),
+            'recall@20':  mean_recall_at_k(true_labels_list, predicted_labels_top100, k=20),
+            'recall@50':  mean_recall_at_k(true_labels_list, predicted_labels_top100, k=50),
+            'recall@100': mean_recall_at_k(true_labels_list, predicted_labels_top100, k=100),
 
-                'retrieved_sections': retrieved_sections  # for analysis/debugging
-            }
+            'ndcg@10':  mean_ndcg_at_k(true_labels_list, predicted_labels_top100, k=10),
+            'ndcg@20':  mean_ndcg_at_k(true_labels_list, predicted_labels_top100, k=20),
+            'ndcg@50':  mean_ndcg_at_k(true_labels_list, predicted_labels_top100, k=50),
+            'ndcg@100': mean_ndcg_at_k(true_labels_list, predicted_labels_top100, k=100),
 
-            # Compute section analysis for this specific query section
-            section_analysis = analyze_retrieved_sections_integrated(
-                retrieved_sections, 
-                query_section=texttype_q, 
-                print_results=False
-            )
-            results[results_key]['section_analysis'] = section_analysis
+            'ndcg_graded@10':  mean_ndcg_at_k_graded(true_graded_list, predicted_labels_top100, k=10),
+            'ndcg_graded@20':  mean_ndcg_at_k_graded(true_graded_list, predicted_labels_top100, k=20),
+            'ndcg_graded@50':  mean_ndcg_at_k_graded(true_graded_list, predicted_labels_top100, k=50),
+            'ndcg_graded@100': mean_ndcg_at_k_graded(true_graded_list, predicted_labels_top100, k=100),
+
+            'map':  mean_average_precision(true_labels_list, predicted_labels_full),
+            'mrr':  mean_reciprocal_rank(true_labels_list, predicted_labels_full),
+        }
+
+        # Section analysis (for the claim->all max-sim retrievals).
+        section_analysis = analyze_retrieved_sections_integrated(
+            retrieved_sections,
+            query_section=query_texttype,
+            print_results=False,
+        )
+        results[results_key]['section_analysis'] = section_analysis
 
         return results
 
@@ -593,7 +620,14 @@ class IPC_ClassificationEval(object):
             probs = np.random.rand(*probs.shape)
         
         # Calculate precision@k
-        pred_topk = np.argsort(-probs, axis=1)
+        # Use np.lexsort for deterministic ranking with explicit tie-break by class index:
+        # primary key = -probs (descending probability), secondary key = class index (ascending).
+        # np.lexsort sorts by the LAST key as primary, so we put -probs last.
+        num_classes = probs.shape[1]
+        class_idx_row = np.arange(num_classes)
+        pred_topk = np.stack([
+            np.lexsort((class_idx_row, -row)) for row in probs
+        ], axis=0)
         metrics = {}
         
         for k in ks:
@@ -798,7 +832,13 @@ class IPC_KNNEval(object):
         knn.fit(X_train, y_train)
         probabilities = knn.predict_proba(X_test)
 
-        pred_topk = np.argsort(-probabilities, axis=1)
+        # KNN probabilities (mean of one-hot neighbor labels) frequently produce ties; use
+        # np.lexsort with explicit tie-break by class index (ascending) for deterministic ranking.
+        num_classes = probabilities.shape[1]
+        class_idx_row = np.arange(num_classes)
+        pred_topk = np.stack([
+            np.lexsort((class_idx_row, -row)) for row in probabilities
+        ], axis=0)
         precision_at_k = {}
         for k in [1, 3, 5]:
             topk_indices = pred_topk[:, :k]  # Extract top-k indices for each sample
@@ -1166,4 +1206,154 @@ class TopologyEval(object):
             logging.error(f"Error in topology evaluation: {str(e)}")
             results['error'] = str(e)
         
+        return results
+
+
+class DAPFAMEval(object):
+    """Evaluate (TA, TA) retrieval on the DAPFAM benchmark.
+
+    Mirrors :func:`evaluate.dapfam_evaluation`. We encode queries and corpus
+    documents once with format ``title + " [SEP] [abstract] " + abstract`` (the
+    "abstract" texttype convention used elsewhere) and then report Recall@k
+    and NDCG@k (binary relevance, k=100) for the three subsets ``ALL``,
+    ``IN``, ``OUT`` defined by IPC3 overlap between query and target.
+    """
+
+    def __init__(self, task_path, params):
+        logging.debug('***** Transfer task : DAPFAM Retrieval *****\n\n')
+        self.seed = params['seed']
+        # Lazy-loaded so importing patenteval doesn't require `datasets`.
+        from patenteval.dapfam_loader import load_dapfam
+
+        self.queries_df, self.documents_df, self.cmap = load_dapfam()
+        self.query_ipc3 = self.queries_df['ipc3'].tolist()
+        self.doc_ipc3 = self.documents_df['ipc3'].tolist()
+
+    def do_prepare(self, params, prepare):
+        return
+
+    def generate_embeddings(self, texts, batcher, params):
+        """Same DataLoader-based batched embedding as PriorArtEval."""
+        dataset = TextDataset(texts)
+        dataloader = DataLoader(
+            dataset,
+            batch_size=params['batcher_batch_size'],
+            shuffle=False,
+            num_workers=0 if torch.distributed.is_initialized() else 4,
+            pin_memory=True,
+        )
+        sample_embedding = batcher(params, [texts[0]])[0]
+        embedding_dim = sample_embedding.shape[-1]
+        embeddings = np.zeros((len(texts), embedding_dim), dtype=np.float32)
+        for i, batch in enumerate(dataloader):
+            batch_embeddings = batcher(params, batch)
+            start_idx = i * params['batcher_batch_size']
+            end_idx = start_idx + len(batch_embeddings)
+            embeddings[start_idx:end_idx] = batch_embeddings
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return embeddings
+
+    def run(self, params, batcher):
+        # Reproducibility
+        torch.manual_seed(self.seed)
+        np.random.seed(self.seed)
+        random.seed(self.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(self.seed)
+        torch.backends.cudnn.benchmark = False
+        os.environ["PYTHONHASHSEED"] = str(self.seed)
+
+        k = 100
+        query_ids = list(self.queries_df.index)
+        doc_ids = list(self.documents_df.index)
+
+        # Encode using the abstract-texttype convention to stay consistent with PriorArtEval.
+        texttype = "abstract"
+        query_texts = [
+            f"{self.queries_df.at[q_id, 'title']} [SEP] [{texttype}] {self.queries_df.at[q_id, 'abstract']}"
+            for q_id in query_ids
+        ]
+        doc_texts = [
+            f"{self.documents_df.at[d_id, 'title']} [SEP] [{texttype}] {self.documents_df.at[d_id, 'abstract']}"
+            for d_id in doc_ids
+        ]
+
+        query_embeddings = self.generate_embeddings(query_texts, batcher, params)
+        document_embeddings = self.generate_embeddings(doc_texts, batcher, params)
+
+        # Optionally cache embeddings under the model output dir for offline analysis.
+        try:
+            embedding_path = os.path.join(params["model_output_path"], 'dapfam_embeddings')
+            os.makedirs(embedding_path, exist_ok=True)
+            suffix = 'final' if params.get('final_eval') else f'step{params.get("current_step", 0)}'
+            np.savez(os.path.join(embedding_path, f'query_embeddings_{suffix}.npz'), emb=query_embeddings)
+            np.savez(os.path.join(embedding_path, f'doc_embeddings_{suffix}.npz'), emb=document_embeddings)
+        except Exception as e:
+            logging.warning(f"DAPFAM embedding caching failed: {e}")
+
+        # L2-normalised cosine similarities.
+        Q = query_embeddings.astype(np.float32).copy()
+        D = document_embeddings.astype(np.float32).copy()
+        if np.any(np.isnan(Q)) or np.any(np.isnan(D)):
+            raise ValueError("NaN detected in DAPFAM embeddings before normalization.")
+        faiss.normalize_L2(Q)
+        faiss.normalize_L2(D)
+        sims = Q @ D.T  # (n_q, n_d), float32
+
+        # Vectorised IPC3 overlap matrix.
+        all_codes = sorted(
+            {c for s in self.query_ipc3 for c in s} | {c for s in self.doc_ipc3 for c in s}
+        )
+        code_to_idx = {c: i for i, c in enumerate(all_codes)}
+        n_codes = len(all_codes)
+        Q_ipc = np.zeros((len(query_ids), n_codes), dtype=np.int8)
+        for i, codes in enumerate(self.query_ipc3):
+            for c in codes:
+                Q_ipc[i, code_to_idx[c]] = 1
+        D_ipc = np.zeros((len(doc_ids), n_codes), dtype=np.int8)
+        for i, codes in enumerate(self.doc_ipc3):
+            for c in codes:
+                D_ipc[i, code_to_idx[c]] = 1
+        overlap = (Q_ipc.astype(np.int32) @ D_ipc.T.astype(np.int32)) > 0  # bool (n_q, n_d)
+
+        q_ids_arr = np.asarray(query_ids)
+        d_ids_arr = np.asarray(doc_ids)
+
+        NEG_INF = np.float32(-1e30)
+        results = {}
+        for subset in ("ALL", "IN", "OUT"):
+            if subset == "ALL":
+                masked_sims = sims
+            elif subset == "IN":
+                masked_sims = np.where(overlap, sims, NEG_INF)
+            else:  # OUT
+                masked_sims = np.where(overlap, NEG_INF, sims)
+
+            n_d = masked_sims.shape[1]
+            top_k = min(k, n_d)
+            if top_k == n_d:
+                top_k_indices = np.argsort(-masked_sims, axis=1, kind='stable')
+            else:
+                part = np.argpartition(-masked_sims, kth=top_k - 1, axis=1)[:, :top_k]
+                row_idx = np.arange(masked_sims.shape[0])[:, None]
+                part_sims = masked_sims[row_idx, part]
+                order = np.argsort(-part_sims, axis=1, kind='stable')
+                top_k_indices = part[row_idx, order]
+
+            cmap = self.cmap[subset]
+            true_labels_list, predicted_labels_list = [], []
+            for q_idx in range(len(q_ids_arr)):
+                true_labels = cmap.get(q_ids_arr[q_idx], [])
+                if not true_labels:
+                    continue  # skip queries without positives in this subset
+                predicted_labels_list.append(d_ids_arr[top_k_indices[q_idx]].tolist())
+                true_labels_list.append(true_labels)
+
+            results[subset] = {
+                f'recall@{k}': mean_recall_at_k(true_labels_list, predicted_labels_list, k=k),
+                f'ndcg@{k}':   mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=k),
+                'n_queries_eval': len(true_labels_list),
+            }
+
         return results

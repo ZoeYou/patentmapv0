@@ -1067,7 +1067,7 @@ class CLTrainer(Trainer):
 
             # Set the task path based on the final_eval flag
             if final_eval:
-                tasks = ['PriorArt', 'Alignment', 'SingularSpectrum', 'Uniformity', 'IPC-Classification', 'IPC-KNN']
+                tasks = ['PriorArt', 'Alignment', 'SingularSpectrum', 'Uniformity', 'IPC-Classification', 'IPC-KNN', 'DAPFAM']
             else:
                 tasks = ['PriorArt', 'IPC-Classification', 'IPC-KNN', 'SingularSpectrum', 'Uniformity', 'Alignment']
                 params['eval_sample_train'] = 25000
@@ -1120,6 +1120,14 @@ class CLTrainer(Trainer):
                         for metric_name, value in v.items():
                             metrics[f"{prefix}_{metric_name}"] = value
 
+                elif task_name == "DAPFAM":
+                    # result: {subset: {recall@100, ndcg@100, n_queries_eval}}
+                    for subset, subset_metrics in result.items():
+                        if not isinstance(subset_metrics, dict):
+                            continue
+                        for metric_name, value in subset_metrics.items():
+                            metrics[f"eval_dapfam_{subset.lower()}_{metric_name}"] = value
+
             if "PriorArt" in results:
                 for pair_key, metrics_dict in results["PriorArt"].items():
                     if not isinstance(metrics_dict, dict):
@@ -1141,7 +1149,7 @@ class CLTrainer(Trainer):
                                             if isinstance(section_stats, dict) and 'percentage' in section_stats:
                                                 full_key = f"eval_sections_{combo_key}_{top_k}_{section}_pct"
                                                 metrics[full_key] = section_stats['percentage']
-                        elif metric_name.startswith("recall@") or metric_name.startswith("ndcg@"):
+                        elif metric_name.startswith("recall@") or metric_name.startswith("ndcg@") or metric_name.startswith("ndcg_graded@") or metric_name in ("map", "mrr"):
                             full_key = f"eval_priorArt_{metric_name}_{combo_key}"
                             metrics[full_key] = value
 
@@ -1154,6 +1162,8 @@ class CLTrainer(Trainer):
                     grouped_metrics[f"ipc_knn/{k}"] = v
                 elif k.startswith("eval_priorArt_"):
                     grouped_metrics[f"priorart/{k}"] = v
+                elif k.startswith("eval_dapfam_"):
+                    grouped_metrics[f"dapfam/{k}"] = v
                 elif k.startswith("eval_singularspectrum"):
                     grouped_metrics[f"stats/singularspectrum/{k}"] = v
                 elif k.startswith("eval_uniformity"):

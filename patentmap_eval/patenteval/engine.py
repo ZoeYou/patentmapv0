@@ -6,7 +6,7 @@ Generic patent representation evaluation scripts wrapper
 from __future__ import absolute_import, division, unicode_literals
 
 from patenteval import utils
-from patenteval.patent import PriorArtEval, IPC_ClassificationEval, IPC_KNNEval, SingularSpectrumEval, UniformityEval, AlignmentEval, TopologyEval
+from patenteval.patent import PriorArtEval, IPC_ClassificationEval, IPC_KNNEval, SingularSpectrumEval, UniformityEval, AlignmentEval, TopologyEval, DAPFAMEval
 
 class PE(object):
     def __init__(self, params, batcher, prepare=None):
@@ -31,7 +31,7 @@ class PE(object):
         self.batcher = batcher
         self.prepare = prepare if prepare else lambda x, y: None
 
-        self.list_tasks = ['IPC-Classification', 'IPC-KNN', 'PriorArt', 'SingularSpectrum', 'Uniformity', 'Alignment', 'Topology']
+        self.list_tasks = ['IPC-Classification', 'IPC-KNN', 'PriorArt', 'SingularSpectrum', 'Uniformity', 'Alignment', 'Topology', 'DAPFAM']
 
     def eval(self, name):
         # evaluate on evaluation [name], either takes string or list of strings
@@ -61,6 +61,9 @@ class PE(object):
             self.evaluation = IPC_ClassificationEval(tpath + '/downstream/IPC-Classification', params=self.params)
         elif name == 'Topology':
             self.evaluation = TopologyEval(prior_art_path, params=self.params)
+        elif name == 'DAPFAM':
+            # DAPFAM data is loaded from Hugging Face inside the class; task_path is unused.
+            self.evaluation = DAPFAMEval(prior_art_path, params=self.params)
         else:
             raise ValueError('Evaluation name not recognized: %s' % name)
 

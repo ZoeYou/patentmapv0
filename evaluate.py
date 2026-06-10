@@ -1617,6 +1617,10 @@ def main():
 
     run_perf200 = args.benchmark in ("perf200", "both")
     run_dapfam = args.benchmark in ("dapfam", "both")
+    # IPC classification is the representation-quality probe attached to the
+    # perf200 pipeline (separate dataset, separate downstream task), so it is
+    # gated alongside perf200. ``--benchmark dapfam`` therefore skips it.
+    run_ipc = run_perf200
 
     print(f"Running evaluation for model: {args.model_name}")
     print("=============================================>>>>>>>>>")
@@ -1941,51 +1945,52 @@ def main():
         model.to(device)
 
         ############################### IPC classification evaluation ###############################
-        # check if the embeddings are already created
-        if os.path.exists(f'{IPC_dir_temp}/train_embeddings.pt') and os.path.exists(f'{IPC_dir_temp}/test_embeddings.pt'):
-            print("Embeddings already created!")
-            train_embeddings = torch.load(f'{IPC_dir_temp}/train_embeddings.pt', weights_only=False)
-            test_embeddings = torch.load(f'{IPC_dir_temp}/test_embeddings.pt', weights_only=False)
-        else:
-            # filter out the documents where text_type is 'abstract'
-            train_dataset = train_dataset[train_dataset['text_type'] == 'abstract']
-            test_dataset = test_dataset[test_dataset['text_type'] == 'abstract']
+        if run_ipc:
+            # check if the embeddings are already created
+            if os.path.exists(f'{IPC_dir_temp}/train_embeddings.pt') and os.path.exists(f'{IPC_dir_temp}/test_embeddings.pt'):
+                print("Embeddings already created!")
+                train_embeddings = torch.load(f'{IPC_dir_temp}/train_embeddings.pt', weights_only=False)
+                test_embeddings = torch.load(f'{IPC_dir_temp}/test_embeddings.pt', weights_only=False)
+            else:
+                # filter out the documents where text_type is 'abstract'
+                train_dataset = train_dataset[train_dataset['text_type'] == 'abstract']
+                test_dataset = test_dataset[test_dataset['text_type'] == 'abstract']
 
-            if args.model_name.lower() == "mpi-inno-comp/paecter":
-                train_texts = train_dataset['text'].apply(lambda x: re.sub(r'\[(?:abstract|claim|summary|invention|drawing|description)\] ', '', x).replace('[SEP]', tokenizer.sep_token))
-                test_texts = test_dataset['text'].apply(lambda x: re.sub(r'\[(?:abstract|claim|summary|invention|drawing|description)\] ', '', x).replace('[SEP]', tokenizer.sep_token))   
+                if args.model_name.lower() == "mpi-inno-comp/paecter":
+                    train_texts = train_dataset['text'].apply(lambda x: re.sub(r'\[(?:abstract|claim|summary|invention|drawing|description)\] ', '', x).replace('[SEP]', tokenizer.sep_token))
+                    test_texts = test_dataset['text'].apply(lambda x: re.sub(r'\[(?:abstract|claim|summary|invention|drawing|description)\] ', '', x).replace('[SEP]', tokenizer.sep_token))
 
-            elif args.model_name.lower() == "anferico/bert-for-patents":
-                train_texts = train_dataset['text']
-                test_texts = test_dataset['text']
+                elif args.model_name.lower() == "anferico/bert-for-patents":
+                    train_texts = train_dataset['text']
+                    test_texts = test_dataset['text']
 
-            # tokenize the texts
-            train_encodings = tokenizer(train_texts.tolist(), truncation=True, padding=True, max_length=512, return_tensors='pt')
-            test_encodings = tokenizer(test_texts.tolist(), truncation=True, padding=True, max_length=512, return_tensors='pt')
+                # tokenize the texts
+                train_encodings = tokenizer(train_texts.tolist(), truncation=True, padding=True, max_length=512, return_tensors='pt')
+                test_encodings = tokenizer(test_texts.tolist(), truncation=True, padding=True, max_length=512, return_tensors='pt')
 
-            # get the embeddings by batch
-            batch_size = 256
-            train_embeddings = np.zeros((len(train_encodings['input_ids']), embedding_dim))
-            test_embeddings = np.zeros((len(test_encodings['input_ids']), embedding_dim))
+                # get the embeddings by batch
+                batch_size = 256
+                train_embeddings = np.zeros((len(train_encodings['input_ids']), embedding_dim))
+                test_embeddings = np.zeros((len(test_encodings['input_ids']), embedding_dim))
 
-            with torch.no_grad():
-                for i in trange(0, len(train_encodings['input_ids']), batch_size, desc="Computing train embeddings"):
-                    batch = {key: torch.tensor(val[i:i+batch_size]).to(device) for key, val in train_encodings.items()}  # Move to GPU
-                    outputs = model(**batch)
-                    train_embeddings[i:i+batch_size] = mean_pooling(outputs.last_hidden_state, train_encodings['attention_mask'][i:i+batch_size]).detach().cpu().numpy()
+                with torch.no_grad():
+                    for i in trange(0, len(train_encodings['input_ids']), batch_size, desc="Computing train embeddings"):
+                        batch = {key: torch.tensor(val[i:i+batch_size]).to(device) for key, val in train_encodings.items()}  # Move to GPU
+                        outputs = model(**batch)
+                        train_embeddings[i:i+batch_size] = mean_pooling(outputs.last_hidden_state, train_encodings['attention_mask'][i:i+batch_size]).detach().cpu().numpy()
 
-                for i in trange(0, len(test_encodings['input_ids']), batch_size, desc="Computing test embeddings"):
-                    batch = {key: torch.tensor(val[i:i+batch_size]).to(device) for key, val in test_encodings.items()}
-                    outputs = model(**batch)
-                    test_embeddings[i:i+batch_size] = mean_pooling(outputs.last_hidden_state, test_encodings['attention_mask'][i:i+batch_size]).detach().cpu().numpy()
+                    for i in trange(0, len(test_encodings['input_ids']), batch_size, desc="Computing test embeddings"):
+                        batch = {key: torch.tensor(val[i:i+batch_size]).to(device) for key, val in test_encodings.items()}
+                        outputs = model(**batch)
+                        test_embeddings[i:i+batch_size] = mean_pooling(outputs.last_hidden_state, test_encodings['attention_mask'][i:i+batch_size]).detach().cpu().numpy()
 
-            print(train_embeddings.shape, test_embeddings.shape)
+                print(train_embeddings.shape, test_embeddings.shape)
 
-            # save the embeddings
-            torch.save(train_embeddings, f'{IPC_dir_temp}/train_embeddings.pt', pickle_protocol=4)
-            torch.save(test_embeddings, f'{IPC_dir_temp}/test_embeddings.pt', pickle_protocol=4)
+                # save the embeddings
+                torch.save(train_embeddings, f'{IPC_dir_temp}/train_embeddings.pt', pickle_protocol=4)
+                torch.save(test_embeddings, f'{IPC_dir_temp}/test_embeddings.pt', pickle_protocol=4)
 
-        ipc_evaluation(train_embeddings, test_embeddings, train_labels, test_labels, train_types, test_types)
+            ipc_evaluation(train_embeddings, test_embeddings, train_labels, test_labels, train_types, test_types)
 
         ############################ Prior-art Search evaluation ############################
         if os.path.exists(f'{priorart_temp_dir}/query_embeddings.pt') and os.path.exists(f'{priorart_temp_dir}/document_embeddings.pt'):
