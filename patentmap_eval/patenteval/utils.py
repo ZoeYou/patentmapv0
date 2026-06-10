@@ -208,7 +208,11 @@ def mean_recall_at_k(true_labels, predicted_labels, k=10):
 
 
 def ndcg_at_k(true_labels, predicted_docs, k=10):
-    """Single-query nDCG."""
+    """
+    Single-query nDCG (binary relevance).
+    """
+    if not true_labels:
+        return None
     top_k_docs = predicted_docs[:k]
     rel = [1 if doc_id in true_labels else 0 for doc_id in top_k_docs]
     dcg = 0.0
@@ -230,13 +234,116 @@ def ndcg_at_k(true_labels, predicted_docs, k=10):
 def mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=10):
     """
     Aggregates ndcg_at_k over multiple queries.
-    Each entry in true_labels_list/predicted_labels_list
-    corresponds to a *single* query.
     """
     scores = []
     for q_true_labels, q_pred_docs in zip(true_labels_list, predicted_labels_list):
-        scores.append(ndcg_at_k(q_true_labels, q_pred_docs, k=k))
-    return np.mean(scores) if scores else 0.0
+        s = ndcg_at_k(q_true_labels, q_pred_docs, k=k)
+        if s is not None:
+            scores.append(s)
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def ndcg_at_k_graded(true_label_to_gain, predicted_docs, k=10):
+    """
+    Single-query nDCG with graded relevance and *linear* gain.
+
+        DCG@k  = sum_{i=1..k} rel_i / log2(i + 1)
+        IDCG@k = same, after sorting all available gains for this query desc
+                 and taking the top-k.
+
+    Args:
+        true_label_to_gain: dict[doc_id -> gain]. Docs not in the dict are
+            treated as non-relevant (gain = 0).
+        predicted_docs: ranked list of doc_ids (top first).
+    """
+    top_k = predicted_docs[:k]
+    dcg = 0.0
+    for i, doc_id in enumerate(top_k, start=1):
+        g = true_label_to_gain.get(doc_id, 0)
+        if g:
+            dcg += g / np.log2(i + 1)
+
+    ideal_gains = sorted(true_label_to_gain.values(), reverse=True)[:k]
+    idcg = 0.0
+    for i, g in enumerate(ideal_gains, start=1):
+        idcg += g / np.log2(i + 1)
+
+    if idcg == 0.0:
+        return 0.0
+    return dcg / idcg
+
+
+def mean_ndcg_at_k_graded(true_label_to_gain_list, predicted_labels_list, k=10):
+    """Aggregates ndcg_at_k_graded over queries; skips queries with no graded relevance."""
+    scores = []
+    for q_true, q_pred in zip(true_label_to_gain_list, predicted_labels_list):
+        if not q_true:
+            continue
+        scores.append(ndcg_at_k_graded(q_true, q_pred, k=k))
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def average_precision(true_labels, predicted_docs):
+    """
+    Compute Average Precision for a single query (full ranking).
+
+    AP = (1 / |R|) * sum_{k=1..N} 1[d_k in R] * Precision@k,
+    where iteration stops once all |R| relevant docs have been found, so the
+    `predicted_docs` argument is expected to be the full (or sufficiently long)
+    ranking. Passing a too-short ranking that misses some relevant docs simply
+    treats those docs as having infinite rank (zero contribution), which makes
+    the value a lower bound on full AP.
+
+    Returns:
+        float in [0, 1], or None if true_labels is empty.
+    """
+    true_set = set(true_labels)
+    if not true_set:
+        return None
+    target = len(true_set)
+    hits = 0
+    cum_precision = 0.0
+    for i, doc_id in enumerate(predicted_docs, start=1):
+        if doc_id in true_set:
+            hits += 1
+            cum_precision += hits / i
+            if hits == target:
+                break
+    return cum_precision / target
+
+
+def mean_average_precision(true_labels_list, predicted_labels_list):
+    """Mean AP across queries; skips queries with empty true_labels."""
+    scores = []
+    for q_true_labels, q_pred_docs in zip(true_labels_list, predicted_labels_list):
+        ap = average_precision(q_true_labels, q_pred_docs)
+        if ap is not None:
+            scores.append(ap)
+    return float(np.mean(scores)) if scores else 0.0
+
+
+def reciprocal_rank(true_labels, predicted_docs):
+    """
+    Reciprocal rank of the first relevant doc in the ranking; 0 if none of the
+    relevant docs appear in `predicted_docs`. Returns None if true_labels is empty.
+    """
+    true_set = set(true_labels)
+    if not true_set:
+        return None
+    for i, doc_id in enumerate(predicted_docs, start=1):
+        if doc_id in true_set:
+            return 1.0 / i
+    return 0.0
+
+
+def mean_reciprocal_rank(true_labels_list, predicted_labels_list):
+    """Mean Reciprocal Rank across queries; skips queries with empty true_labels."""
+    scores = []
+    for q_true_labels, q_pred_docs in zip(true_labels_list, predicted_labels_list):
+        rr = reciprocal_rank(q_true_labels, q_pred_docs)
+        if rr is not None:
+            scores.append(rr)
+    return float(np.mean(scores)) if scores else 0.0
 
 
 
@@ -259,6 +366,40 @@ def citation_to_citing_to_cited_dict(citations):
                 citing_to_cited_dict[citing_id].append(cited_patent)
         
     return citing_to_cited_dict
+
+
+# Default citation-type → relevance gain mapping (EPO/PCT-style).
+#   X = novelty/inventive-step destroying alone           → strongest
+#   Y = relevant only in combination with another doc    → medium
+#   A = background / state-of-the-art                    → weakest
+DEFAULT_CITATION_TYPE_TO_GAIN = {'X': 3, 'Y': 2, 'A': 1}
+
+
+def citation_to_citing_to_cited_graded_dict(citations, type_to_gain=None):
+    """
+    Convert raw citations to {citing_id: {cited_id: gain}} using the citation
+    `type` field as a graded-relevance signal.
+
+    - Default gains: X=3, Y=2, A=1 (see DEFAULT_CITATION_TYPE_TO_GAIN).
+    - Types absent from `type_to_gain` (or with non-positive gain) are dropped.
+    - If the same (citing, cited) pair appears with multiple types, the *max*
+      gain is kept (i.e. the most severe relevance label wins).
+    """
+    if type_to_gain is None:
+        type_to_gain = DEFAULT_CITATION_TYPE_TO_GAIN
+
+    citing_to_cited_graded = defaultdict(dict)
+    for citing_id, cited_info in citations.items():
+        for cited_line in cited_info:
+            t = cited_line.get('type')
+            g = type_to_gain.get(t, 0)
+            if g <= 0:
+                continue
+            cid = cited_line['cited_id']
+            prev = citing_to_cited_graded[citing_id].get(cid, 0)
+            if g > prev:
+                citing_to_cited_graded[citing_id][cid] = g
+    return citing_to_cited_graded
 
 
 
@@ -792,7 +933,7 @@ def compute_alignment(embeddings1, embeddings2):
     return float(mean_squared_l2_distance)
 
 
-def compute_intra_document_cohesion(embeddings_dict, sections=None, normalize_by_random=True, num_random_pairs=10000):
+def compute_intra_document_cohesion(embeddings_dict, sections=None, normalize_by_random=True, num_random_pairs=10000, random_seed=42):
     """
     Compute intra-document cohesion: average distance between different sections 
     of the same document, optionally normalized by random baseline.
@@ -803,6 +944,9 @@ def compute_intra_document_cohesion(embeddings_dict, sections=None, normalize_by
         sections: list of section names to consider (default: ['abstract', 'claim', 'invention'])
         normalize_by_random: bool, whether to normalize by random pair distances (default: True)
         num_random_pairs: int, number of random pairs to sample for baseline (default: 10000)
+        random_seed: int, seed for the local RNG used to sample random pairs so the
+                     baseline (and therefore normalized_cohesion / cohesion_improvement)
+                     is fully reproducible (default: 42)
     
     Returns:
         dict with cohesion statistics:
@@ -833,27 +977,30 @@ def compute_intra_document_cohesion(embeddings_dict, sections=None, normalize_by
         for section in sections:
             all_embeddings.append(embeddings_dict[section])
         all_embeddings = np.vstack(all_embeddings)  # Shape: (n_docs * n_sections, embedding_dim)
-        
+
+        # Use a local RNG so we do not depend on (or perturb) the global numpy RNG state.
+        rng = np.random.RandomState(random_seed)
+
         # Sample random pairs and compute their cosine distances
         n_total = all_embeddings.shape[0]
         random_distances = []
-        
+
         for _ in range(num_random_pairs):
             # Sample two random indices
-            i, j = np.random.choice(n_total, size=2, replace=False)
-            
+            i, j = rng.choice(n_total, size=2, replace=False)
+
             # Compute cosine distance between random pair
             emb_i = all_embeddings[i]
             emb_j = all_embeddings[j]
-            
+
             # Normalize embeddings for cosine distance
             emb_i_norm = emb_i / (np.linalg.norm(emb_i) + 1e-8)
             emb_j_norm = emb_j / (np.linalg.norm(emb_j) + 1e-8)
-            
+
             cosine_sim = np.dot(emb_i_norm, emb_j_norm)
             cosine_dist = 1 - cosine_sim
             random_distances.append(cosine_dist)
-        
+
         random_baseline = np.mean(random_distances)
     
     cohesion_scores = []
