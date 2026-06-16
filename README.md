@@ -229,20 +229,32 @@ python evaluate.py \
 
 The evaluation framework automatically assesses models on multiple patent-specific tasks:
 
-1. **IPC Classification**: Classifies patents into International Patent Classification categories
-2. **Prior Art Search**: Retrieves relevant prior art patents (measures Recall@K, NDCG@K)
-3. **Embedding Quality Metrics**:
-   - Uniformity: How well embeddings spread across the representation space
-   - Alignment: Semantic alignment between related patents
-   - Topology: Structure preservation in embedding space
+1. **IPC Classification**:
+    - Linear probe classification (Precision@1/3/5)
+    - KNN classification in embedding space (Precision@1/3/5)
+2. **Prior Art Search (perf200)**:
+    - Abstract -> Abstract retrieval
+    - Claim -> All-sections retrieval with max-sim section aggregation
+    - Metrics: Recall@10/20/50/100, NDCG@10/20/50/100, MAP, MRR
+    - Optional graded NDCG metrics when graded citations are available
+3. **DAPFAM Retrieval** (`--benchmark dapfam` or `--benchmark both`):
+    - Evaluated on `ALL`, `IN`, and `OUT` subsets
+    - Metrics: Recall@100, NDCG@100, and number of evaluated queries
+4. **Embedding Quality Metrics**:
+    - Uniformity
+    - Alignment (citation-pair based)
+    - SSD (singular spectrum divergence)
+    - Topology / intra-document cohesion
 
 ### Output
 
-Results are saved in the specified output directory with detailed metrics for each task, including:
-- Classification Precision@K (K=1,3,5)
-- Retrieval metrics: Recall@K, NDCG@K (K=10,20,50,100)
-- Embedding quality scores (alignment, uniformity, SSD, intra-document cohesion, etc.)
-- Per-task performance breakdowns
+`evaluate.py` writes intermediate embedding caches under the specified `--output_dir` (for example `IPC-Classification_temp_*`, `priorart_temp_*`, `dapfam_temp_*`) so reruns can reuse computed embeddings.
+
+Task metrics are primarily reported in the terminal output, including:
+- IPC Precision@1/3/5 (linear probe and KNN)
+- Prior-art retrieval metrics (Recall@K, NDCG@K, MAP, MRR)
+- DAPFAM subset metrics (`ALL` / `IN` / `OUT`)
+- Embedding quality metrics (uniformity, alignment, SSD, topology/cohesion)
 
 
 ## Project Structure
