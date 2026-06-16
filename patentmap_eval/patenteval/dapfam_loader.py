@@ -69,6 +69,7 @@ def load_dapfam(
         {
             "title": queries["title_en"],
             "abstract": queries["abstract_en"],
+            "claims_text": queries["claims_text"],
             "ipc3": [
                 set(x or []) for x in queries["classifications_ipcr_list_first_three_chars_list"]
             ],
@@ -81,6 +82,7 @@ def load_dapfam(
         {
             "title": corpus["title_en"],
             "abstract": corpus["abstract_en"],
+            "claims_text": corpus["claims_text"],
             "ipc3": [
                 set(x or []) for x in corpus["classifications_ipcr_list_first_three_chars_list"]
             ],

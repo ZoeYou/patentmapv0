@@ -231,6 +231,75 @@ def cls_pooling(model_output, attention_mask):
     return model_output.last_hidden_state[:, 0]  # Explicitly using last_hidden_state
 
 
+_FIRST_CLAIM_BOUNDARY_RE = re.compile(r'\s2\s*\.\s')
+
+
+def extract_first_claim(claims_text):
+    """Return the first claim from DAPFAM's ``claims_text`` field.
+
+    DAPFAM claims are stored as a single string like
+    ``"1. <claim 1> 2. <claim 2> 3. ..."`` (sometimes prefixed with a
+    spaced ``"c l a i m s "`` header). We split at the first ``" 2. "``
+    boundary; if no claim 2 is found we return the whole string. The
+    leading ``"1."`` numbering is kept — it is short and harmless after
+    tokenization (and getting rid of it requires another fragile regex).
+    """
+    if not claims_text:
+        return ""
+    m = _FIRST_CLAIM_BOUNDARY_RE.search(claims_text)
+    if m:
+        return claims_text[:m.start()].strip()
+    return claims_text.strip()
+
+
+def make_bert_pooler_safe(model):
+    """Make the BERT pooler safe against the cublasLt strided-matmul failure.
+
+    Background: ``BertModel.forward`` unconditionally runs
+    ``self.pooler(sequence_output)``. The default ``BertPooler.forward`` does
+    ``first_token_tensor = hidden_states[:, 0]``, producing a non-contiguous
+    view whose leading stride is ``seq_len * hidden`` (e.g. ``mat2_ld 524288``
+    in cuBLAS error messages). On some CUDA/cuBLAS builds this triggers
+    ``CUBLAS_STATUS_NOT_INITIALIZED`` inside ``cublasLtMatmul`` for certain
+    batch sizes.
+
+    We *cannot* simply set ``pooler = None`` for adapter-wrapped models
+    (``adapters.models.bert.adapter_model.BertAdapterModel.forward`` indexes
+    ``outputs[1]`` and would raise ``IndexError`` if the pooler is gone).
+    Instead we monkey-patch every BERT pooler we can find on the (possibly
+    nested) model so that the first-token tensor is made contiguous before the
+    Linear, which preserves the output structure but avoids the bad stride.
+    """
+    import torch.nn as _nn
+
+    def _make_safe(pooler):
+        if pooler is None or not hasattr(pooler, 'dense'):
+            return
+        if getattr(pooler, '_contiguous_pooler_patched', False):
+            return
+        dense = pooler.dense
+        activation = getattr(pooler, 'activation', None)
+
+        def _patched_forward(hidden_states):
+            first_token_tensor = hidden_states[:, 0].contiguous()
+            pooled = dense(first_token_tensor)
+            if activation is not None:
+                pooled = activation(pooled)
+            return pooled
+
+        pooler.forward = _patched_forward
+        pooler._contiguous_pooler_patched = True
+
+    for m in (
+        model,
+        getattr(model, 'bert', None),
+        getattr(model, 'base_model', None),
+        getattr(getattr(model, 'base_model', None), 'bert', None),
+    ):
+        if m is not None:
+            _make_safe(getattr(m, 'pooler', None))
+
+
 def get_encoder_last_hidden_state(model, batch):
     """Get last_hidden_state from model; for adapter models with a head, use base_model so we get encoder output."""
     outputs = model(**batch)
@@ -285,7 +354,7 @@ def ipc_evaluation(train_embeddings, test_embeddings, train_labels, test_labels,
     # of any global torch RNG state consumed earlier (e.g. by model encoding).
     train_dataset = TensorDataset(X_train, y_train)
     loader_generator = torch.Generator().manual_seed(42)
-    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, generator=loader_generator)
+    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, generator=loader_generator, drop_last=True)
 
     # Initialize model
     ipc_model = LinearClassifier(input_dim=X_train.shape[1], num_classes=y_train.shape[1]).to(device)
@@ -623,17 +692,22 @@ def dapfam_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings,
                        citation_mapping_by_subset, query_ipc3, doc_ipc3, k=100):
     """Evaluate (TA, TA) retrieval on the DAPFAM benchmark.
 
-    DAPFAM defines three subsets that differ only in the per-query candidate
-    pool, derived from 3-char IPC code overlap between query and target:
+    DAPFAM defines three subsets based on 3-char IPC overlap between query and
+    target. The reported numbers in DAPFAM Table 19 and PatenTEB Table 16 have
+    ``OUT << ALL`` (e.g. Snowflake 0.047 vs 0.284), which is only consistent
+    with **full-corpus ranking + per-subset relevance filtering**, not with
+    restricting the candidate pool per subset. Pool restriction would make OUT
+    *easier* than ALL (smaller, weaker-distractor pool) and cannot reproduce
+    the published ordering.
 
-    * ``ALL`` — full corpus.
-    * ``IN``  — only targets whose IPC3 set intersects the query's IPC3 set.
-    * ``OUT`` — only targets whose IPC3 set is disjoint from the query's.
+    Protocol implemented here (matches the published numbers):
 
-    For each subset we mask non-candidate similarities to ``-inf``, take the
-    top-``k`` per query, and compute Recall@k and NDCG@k. Both metrics are
-    macro-averaged over queries that have at least one positive in that
-    subset (other queries are skipped, matching DAPFAM's reported protocol).
+    1. Rank each query against the **full corpus** once (top-``k``).
+    2. For each subset, restrict the gold set:
+       * ``ALL`` — all positives.
+       * ``IN``  — positives sharing ≥1 IPC3 code with the query.
+       * ``OUT`` — positives disjoint in IPC3 from the query.
+    3. Recall@k / NDCG@k macro-averaged over queries with ≥1 subset positive.
 
     For binary relevance ``rel ∈ {0, 1}`` DAPFAM's exponential-gain NDCG
     ``(2^rel - 1) / log2(i + 1)`` collapses to the linear-gain formula used by
@@ -672,62 +746,78 @@ def dapfam_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings,
     faiss.normalize_L2(D)
     sims = Q @ D.T  # (n_q, n_d), float32
 
-    # Vectorised IPC3 overlap: build binary indicator matrices and multiply.
-    all_codes = sorted(
-        {c for s in query_ipc3 for c in s} | {c for s in doc_ipc3 for c in s}
-    )
-    code_to_idx = {c: i for i, c in enumerate(all_codes)}
-    n_codes = len(all_codes)
-    Q_ipc = np.zeros((len(query_ids), n_codes), dtype=np.int8)
-    for i, codes in enumerate(query_ipc3):
-        for c in codes:
-            Q_ipc[i, code_to_idx[c]] = 1
-    D_ipc = np.zeros((len(doc_ids), n_codes), dtype=np.int8)
-    for i, codes in enumerate(doc_ipc3):
-        for c in codes:
-            D_ipc[i, code_to_idx[c]] = 1
-    overlap = (Q_ipc.astype(np.int32) @ D_ipc.T.astype(np.int32)) > 0  # bool (n_q, n_d)
-
     q_ids_arr = np.asarray(query_ids)
     d_ids_arr = np.asarray(doc_ids)
 
-    NEG_INF = np.float32(-1e30)
+    # Full-corpus top-k once: argpartition + stable sort of the k entries.
+    n_d = sims.shape[1]
+    top_k = min(k, n_d)
+    if top_k == n_d:
+        top_k_indices = np.argsort(-sims, axis=1, kind='stable')
+    else:
+        part = np.argpartition(-sims, kth=top_k - 1, axis=1)[:, :top_k]
+        row_idx = np.arange(sims.shape[0])[:, None]
+        part_sims = sims[row_idx, part]
+        order = np.argsort(-part_sims, axis=1, kind='stable')
+        top_k_indices = part[row_idx, order]
+
+    # Predicted ranked id lists per query (full-corpus ranking, identical across subsets).
+    predicted_labels_full = [d_ids_arr[top_k_indices[i]].tolist() for i in range(len(q_ids_arr))]
+
     results = {}
     print_subsection_header(
-        f"DAPFAM Retrieval (NDCG@{k}, Recall@{k}; macro over queries with ≥1 positive)"
+        f"DAPFAM Retrieval (NDCG@{k}, Recall@{k}; full-corpus ranking, per-subset relevance)"
     )
     for subset in ("ALL", "IN", "OUT"):
-        if subset == "ALL":
-            masked_sims = sims
-        elif subset == "IN":
-            masked_sims = np.where(overlap, sims, NEG_INF)
-        else:  # OUT
-            masked_sims = np.where(overlap, NEG_INF, sims)
-
-        n_d = masked_sims.shape[1]
-        top_k = min(k, n_d)
-        if top_k == n_d:
-            top_k_indices = np.argsort(-masked_sims, axis=1, kind='stable')
-        else:
-            # argpartition for top-k, then stable sort the k entries.
-            part = np.argpartition(-masked_sims, kth=top_k - 1, axis=1)[:, :top_k]
-            row_idx = np.arange(masked_sims.shape[0])[:, None]
-            part_sims = masked_sims[row_idx, part]
-            order = np.argsort(-part_sims, axis=1, kind='stable')
-            top_k_indices = part[row_idx, order]
-
         cmap = citation_mapping_by_subset[subset]
         true_labels_list, predicted_labels_list = [], []
-        for q_idx in range(len(q_ids_arr)):
-            true_labels = cmap.get(q_ids_arr[q_idx], [])
+        for q_idx, qid in enumerate(q_ids_arr):
+            true_labels = cmap.get(qid, [])
             if not true_labels:
                 continue  # skip queries without positives in this subset
-            predicted_labels_list.append(d_ids_arr[top_k_indices[q_idx]].tolist())
             true_labels_list.append(true_labels)
+            predicted_labels_list.append(predicted_labels_full[q_idx])
 
         results[subset] = {
             f'recall@{k}': mean_recall_at_k(true_labels_list, predicted_labels_list, k=k),
             f'ndcg@{k}':   mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=k),
+            'n_queries_eval': len(true_labels_list),
+        }
+        print_metric_table(results[subset], f"DAPFAM-{subset}")
+
+    return results
+
+
+def dapfam_evaluation_from_predictions(query_ids, predicted_labels_full,
+                                      citation_mapping_by_subset, k=100):
+    """Evaluate DAPFAM from precomputed ranked predictions.
+
+    Args:
+        query_ids: list[str] query ids aligned with ``predicted_labels_full``.
+        predicted_labels_full: list[list[str]], ranked doc ids per query.
+        citation_mapping_by_subset: dict with keys ``ALL``, ``IN``, ``OUT``.
+        k: rank cutoff.
+
+    Returns:
+        dict of per-subset metrics.
+    """
+    results = {}
+    print_subsection_header(
+        f"DAPFAM Retrieval (NDCG@{k}, Recall@{k}; full-corpus ranking, per-subset relevance)"
+    )
+    for subset in ("ALL", "IN", "OUT"):
+        cmap = citation_mapping_by_subset[subset]
+        true_labels_list, predicted_labels_list = [], []
+        for q_idx, qid in enumerate(query_ids):
+            true_labels = cmap.get(qid, [])
+            if not true_labels:
+                continue
+            true_labels_list.append(true_labels)
+            predicted_labels_list.append(predicted_labels_full[q_idx])
+
+        results[subset] = {
+            f'recall@{k}': mean_recall_at_k(true_labels_list, predicted_labels_list, k=k),
+            f'ndcg@{k}': mean_ndcg_at_k(true_labels_list, predicted_labels_list, k=k),
             'n_queries_eval': len(true_labels_list),
         }
         print_metric_table(results[subset], f"DAPFAM-{subset}")
@@ -1613,6 +1703,21 @@ def main():
             "task only; 'dapfam' = DAPFAM (TA->TA) only; 'both' = run both."
         ),
     )
+    parser.add_argument(
+        "--dapfam_texttype",
+        type=str,
+        default="plain",
+        choices=["ta", "tac", "plain"],
+        help=(
+            "DAPFAM input format. 'ta' = title + abstract (default, matches our "
+            "perf200 'abstract' texttype with section markers). 'tac' = ta + "
+            "first claim, still with section markers. 'plain' = "
+            "'title abstract first_claim' joined by single spaces with NO SEP "
+            "and NO section markers — matches PatenTEB §5.4 / "
+            "sentence-transformers InformationRetrievalEvaluator protocol. "
+            "Each mode caches embeddings in a separate subdir."
+        ),
+    )
     args = parser.parse_args()
 
     run_perf200 = args.benchmark in ("perf200", "both")
@@ -1734,14 +1839,16 @@ def main():
         dapfam_queries_df, dapfam_documents_df, dapfam_cmap = load_dapfam()
         dapfam_query_ipc3 = dapfam_queries_df['ipc3'].tolist()
         dapfam_doc_ipc3 = dapfam_documents_df['ipc3'].tolist()
-        dapfam_temp_dir = os.path.join(args.output_dir, f'dapfam_temp_{model_basename}')
+        dapfam_cache_suffix = '' if args.dapfam_texttype == 'ta' else f'_{args.dapfam_texttype}'
+        dapfam_temp_dir = os.path.join(args.output_dir, f'dapfam_temp_{model_basename}{dapfam_cache_suffix}')
         os.makedirs(dapfam_temp_dir, exist_ok=True)
         print(
             f"DAPFAM loaded: {len(dapfam_queries_df)} queries, "
             f"{len(dapfam_documents_df)} docs, "
             f"positives ALL={sum(len(v) for v in dapfam_cmap['ALL'].values())} "
             f"IN={sum(len(v) for v in dapfam_cmap['IN'].values())} "
-            f"OUT={sum(len(v) for v in dapfam_cmap['OUT'].values())}"
+            f"OUT={sum(len(v) for v in dapfam_cmap['OUT'].values())} "
+            f"(input format: {args.dapfam_texttype})"
         )
 
 
@@ -1770,6 +1877,10 @@ def main():
             # classification (specter2_classification): IPC linear probe.
             model.load_adapter("allenai/specter2", source="hf", load_as="specter2", set_active=True)
             model.load_adapter("allenai/specter2_classification", source="hf", load_as="specter2_classification")
+        # Drop the BERT pooler: we only consume last_hidden_state, and the
+        # pooler's strided sequence_output[:, 0] matmul has triggered
+        # CUBLAS_STATUS_NOT_INITIALIZED on partial last batches.
+        make_bert_pooler_safe(model)
         embedding_dim = model.config.hidden_size
         model.to(device)
         ############################### IPC classification evaluation ###############################
@@ -1910,6 +2021,105 @@ def main():
         document_embeddings = document_embeddings.astype('float32')
         prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, citation_mapping_graded=citation_mapping_graded)
 
+        ############################ DAPFAM (TitlAbs -> TitlAbs) ############################
+        if run_dapfam:
+            dapfam_q_path = f'{dapfam_temp_dir}/query_embeddings.pt'
+            dapfam_d_path = f'{dapfam_temp_dir}/document_embeddings.pt'
+            if os.path.exists(dapfam_q_path) and os.path.exists(dapfam_d_path):
+                print("DAPFAM embeddings already cached.")
+                dapfam_q_emb = torch.load(dapfam_q_path, weights_only=False)
+                dapfam_d_emb = torch.load(dapfam_d_path, weights_only=False)
+            else:
+                if args.dapfam_texttype == 'plain':
+                    dapfam_q_texts = [
+                        " ".join(s for s in (t, a, extract_first_claim(c)) if s)
+                        for t, a, c in zip(
+                            dapfam_queries_df['title'].tolist(),
+                            dapfam_queries_df['abstract'].tolist(),
+                            dapfam_queries_df['claims_text'].tolist(),
+                        )
+                    ]
+                    dapfam_d_texts = [
+                        " ".join(s for s in (t, a, extract_first_claim(c)) if s)
+                        for t, a, c in zip(
+                            dapfam_documents_df['title'].tolist(),
+                            dapfam_documents_df['abstract'].tolist(),
+                            dapfam_documents_df['claims_text'].tolist(),
+                        )
+                    ]
+                else:
+                    sep = f" {tokenizer.sep_token} "
+                    dapfam_q_texts = [
+                        t + sep + a
+                        for t, a in zip(
+                            dapfam_queries_df['title'].tolist(),
+                            dapfam_queries_df['abstract'].tolist(),
+                        )
+                    ]
+                    dapfam_d_texts = [
+                        t + sep + a
+                        for t, a in zip(
+                            dapfam_documents_df['title'].tolist(),
+                            dapfam_documents_df['abstract'].tolist(),
+                        )
+                    ]
+                    if args.dapfam_texttype == 'tac':
+                        dapfam_q_texts = [
+                            txt + sep + extract_first_claim(c)
+                            for txt, c in zip(dapfam_q_texts, dapfam_queries_df['claims_text'].tolist())
+                        ]
+                        dapfam_d_texts = [
+                            txt + sep + extract_first_claim(c)
+                            for txt, c in zip(dapfam_d_texts, dapfam_documents_df['claims_text'].tolist())
+                        ]
+
+                dapfam_q_enc = tokenizer(
+                    dapfam_q_texts,
+                    truncation=True,
+                    padding=True,
+                    max_length=512,
+                    return_tensors='pt',
+                    return_token_type_ids=False,
+                )
+                dapfam_d_enc = tokenizer(
+                    dapfam_d_texts,
+                    truncation=True,
+                    padding=True,
+                    max_length=512,
+                    return_tensors='pt',
+                    return_token_type_ids=False,
+                )
+
+                dapfam_q_emb = np.zeros((len(dapfam_q_enc['input_ids']), embedding_dim), dtype=np.float32)
+                dapfam_d_emb = np.zeros((len(dapfam_d_enc['input_ids']), embedding_dim), dtype=np.float32)
+                dapfam_bs = 128
+                with torch.no_grad():
+                    if args.model_name.lower() == "allenai/specter2_base":
+                        model.set_active_adapters("specter2")
+                    for i in trange(0, len(dapfam_q_enc['input_ids']), dapfam_bs, desc="DAPFAM query embeddings"):
+                        batch = {k: v[i:i+dapfam_bs].to(device) for k, v in dapfam_q_enc.items()}
+                        last_h = get_encoder_last_hidden_state(model, batch)
+                        dapfam_q_emb[i:i+dapfam_bs] = last_h[:, 0, :].detach().cpu().numpy()
+                    for i in trange(0, len(dapfam_d_enc['input_ids']), dapfam_bs, desc="DAPFAM doc embeddings"):
+                        batch = {k: v[i:i+dapfam_bs].to(device) for k, v in dapfam_d_enc.items()}
+                        last_h = get_encoder_last_hidden_state(model, batch)
+                        dapfam_d_emb[i:i+dapfam_bs] = last_h[:, 0, :].detach().cpu().numpy()
+
+                torch.save(dapfam_q_emb, dapfam_q_path, pickle_protocol=4)
+                torch.save(dapfam_d_emb, dapfam_d_path, pickle_protocol=4)
+                print(f"DAPFAM embeddings shape: q={dapfam_q_emb.shape}, d={dapfam_d_emb.shape}")
+
+            dapfam_evaluation(
+                dapfam_queries_df.index.tolist(),
+                dapfam_documents_df.index.tolist(),
+                dapfam_q_emb,
+                dapfam_d_emb,
+                dapfam_cmap,
+                dapfam_query_ipc3,
+                dapfam_doc_ipc3,
+                k=100,
+            )
+
 
         ################################ Comprehensive Embedding Quality Evaluation ################################
         # load embeddings from prior-art search task
@@ -1935,6 +2145,10 @@ def main():
         # load the model and tokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.model_name)
         model = AutoModel.from_pretrained(args.model_name)
+        # Drop the BERT pooler: we only consume last_hidden_state, and the
+        # pooler's strided sequence_output[:, 0] matmul has triggered
+        # CUBLAS_STATUS_NOT_INITIALIZED on partial last batches.
+        make_bert_pooler_safe(model)
 
         if args.model_name.lower() == "anferico/bert-for-patents":
             # add special tokens to the tokenizer
@@ -2066,14 +2280,8 @@ def main():
             prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, citation_mapping_graded=citation_mapping_graded)
 
         ############################ DAPFAM (TitlAbs -> TitlAbs) ############################
-        # Stage-W3 wire-up: only the anferico / paecter branch consumes DAPFAM for now.
-        # Each query / target is encoded once as a single sequence formed by
-        # ``title + abstract`` joined with the same separator used in this branch's
-        # perf200 "abstract" texttype, so the input distribution is identical.
-        if run_dapfam and args.model_name.lower() in (
-            "mpi-inno-comp/paecter",
-            "anferico/bert-for-patents",
-        ):
+        # Each query / target is encoded once as a single sequence.
+        if run_dapfam:
             dapfam_q_path = f'{dapfam_temp_dir}/query_embeddings.pt'
             dapfam_d_path = f'{dapfam_temp_dir}/document_embeddings.pt'
             if os.path.exists(dapfam_q_path) and os.path.exists(dapfam_d_path):
@@ -2081,7 +2289,28 @@ def main():
                 dapfam_q_emb = torch.load(dapfam_q_path, weights_only=False)
                 dapfam_d_emb = torch.load(dapfam_d_path, weights_only=False)
             else:
-                if args.model_name.lower() == "mpi-inno-comp/paecter":
+                if args.dapfam_texttype == 'plain':
+                    # PatenTEB §5.4 protocol: plain space-joined title + abstract + first claim,
+                    # no SEP, no section markers. Used for both paecter and anferico in this branch
+                    # because PatenTEB also evaluates both via sentence-transformers
+                    # InformationRetrievalEvaluator (raw text, mean pooling fallback).
+                    dapfam_q_texts = [
+                        " ".join(s for s in (t, a, extract_first_claim(c)) if s)
+                        for t, a, c in zip(
+                            dapfam_queries_df['title'].tolist(),
+                            dapfam_queries_df['abstract'].tolist(),
+                            dapfam_queries_df['claims_text'].tolist(),
+                        )
+                    ]
+                    dapfam_d_texts = [
+                        " ".join(s for s in (t, a, extract_first_claim(c)) if s)
+                        for t, a, c in zip(
+                            dapfam_documents_df['title'].tolist(),
+                            dapfam_documents_df['abstract'].tolist(),
+                            dapfam_documents_df['claims_text'].tolist(),
+                        )
+                    ]
+                elif args.model_name.lower() == "mpi-inno-comp/paecter":
                     sep = f" {tokenizer.sep_token} "
                     dapfam_q_texts = [t + sep + a for t, a in zip(
                         dapfam_queries_df['title'].tolist(),
@@ -2091,6 +2320,15 @@ def main():
                         dapfam_documents_df['title'].tolist(),
                         dapfam_documents_df['abstract'].tolist(),
                     )]
+                    if args.dapfam_texttype == 'tac':
+                        dapfam_q_texts = [
+                            txt + sep + extract_first_claim(c)
+                            for txt, c in zip(dapfam_q_texts, dapfam_queries_df['claims_text'].tolist())
+                        ]
+                        dapfam_d_texts = [
+                            txt + sep + extract_first_claim(c)
+                            for txt, c in zip(dapfam_d_texts, dapfam_documents_df['claims_text'].tolist())
+                        ]
                 else:  # anferico/bert-for-patents
                     dapfam_q_texts = [t + " [SEP] [abstract] " + a for t, a in zip(
                         dapfam_queries_df['title'].tolist(),
@@ -2100,6 +2338,15 @@ def main():
                         dapfam_documents_df['title'].tolist(),
                         dapfam_documents_df['abstract'].tolist(),
                     )]
+                    if args.dapfam_texttype == 'tac':
+                        dapfam_q_texts = [
+                            txt + " [SEP] [claim] " + extract_first_claim(c)
+                            for txt, c in zip(dapfam_q_texts, dapfam_queries_df['claims_text'].tolist())
+                        ]
+                        dapfam_d_texts = [
+                            txt + " [SEP] [claim] " + extract_first_claim(c)
+                            for txt, c in zip(dapfam_d_texts, dapfam_documents_df['claims_text'].tolist())
+                        ]
 
                 dapfam_q_enc = tokenizer(dapfam_q_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
                 dapfam_d_enc = tokenizer(dapfam_d_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
@@ -2162,6 +2409,10 @@ def main():
         # load the model and tokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.model_name)
         model = AutoModel.from_pretrained(args.model_name)
+        # Drop the BERT pooler: we only consume last_hidden_state, and the
+        # pooler's strided sequence_output[:, 0] matmul has triggered
+        # CUBLAS_STATUS_NOT_INITIALIZED on partial last batches.
+        make_bert_pooler_safe(model)
 
         embedding_dim = model.config.hidden_size
         model.to(device)
@@ -2265,6 +2516,95 @@ def main():
         query_embeddings = query_embeddings.astype('float32')
         document_embeddings = document_embeddings.astype('float32')
         prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, citation_mapping_graded=citation_mapping_graded)
+
+        ############################ DAPFAM (TitlAbs -> TitlAbs) ############################
+        if run_dapfam:
+            dapfam_q_path = f'{dapfam_temp_dir}/query_embeddings.pt'
+            dapfam_d_path = f'{dapfam_temp_dir}/document_embeddings.pt'
+            if os.path.exists(dapfam_q_path) and os.path.exists(dapfam_d_path):
+                print("DAPFAM embeddings already cached.")
+                dapfam_q_emb = torch.load(dapfam_q_path, weights_only=False)
+                dapfam_d_emb = torch.load(dapfam_d_path, weights_only=False)
+            else:
+                if args.dapfam_texttype == 'plain':
+                    dapfam_q_texts = [
+                        " ".join(s for s in (t, a, extract_first_claim(c)) if s)
+                        for t, a, c in zip(
+                            dapfam_queries_df['title'].tolist(),
+                            dapfam_queries_df['abstract'].tolist(),
+                            dapfam_queries_df['claims_text'].tolist(),
+                        )
+                    ]
+                    dapfam_d_texts = [
+                        " ".join(s for s in (t, a, extract_first_claim(c)) if s)
+                        for t, a, c in zip(
+                            dapfam_documents_df['title'].tolist(),
+                            dapfam_documents_df['abstract'].tolist(),
+                            dapfam_documents_df['claims_text'].tolist(),
+                        )
+                    ]
+                else:
+                    sep = f" {tokenizer.sep_token} "
+                    dapfam_q_texts = [
+                        t + sep + a
+                        for t, a in zip(
+                            dapfam_queries_df['title'].tolist(),
+                            dapfam_queries_df['abstract'].tolist(),
+                        )
+                    ]
+                    dapfam_d_texts = [
+                        t + sep + a
+                        for t, a in zip(
+                            dapfam_documents_df['title'].tolist(),
+                            dapfam_documents_df['abstract'].tolist(),
+                        )
+                    ]
+                    if args.dapfam_texttype == 'tac':
+                        dapfam_q_texts = [
+                            txt + sep + extract_first_claim(c)
+                            for txt, c in zip(dapfam_q_texts, dapfam_queries_df['claims_text'].tolist())
+                        ]
+                        dapfam_d_texts = [
+                            txt + sep + extract_first_claim(c)
+                            for txt, c in zip(dapfam_d_texts, dapfam_documents_df['claims_text'].tolist())
+                        ]
+
+                dapfam_q_enc = tokenizer(dapfam_q_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
+                dapfam_d_enc = tokenizer(dapfam_d_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
+
+                dapfam_q_emb = np.zeros((len(dapfam_q_enc['input_ids']), embedding_dim), dtype=np.float32)
+                dapfam_d_emb = np.zeros((len(dapfam_d_enc['input_ids']), embedding_dim), dtype=np.float32)
+                dapfam_bs = 64
+                with torch.no_grad():
+                    for i in trange(0, len(dapfam_q_enc['input_ids']), dapfam_bs, desc="DAPFAM query embeddings"):
+                        batch = {k: torch.tensor(v[i:i+dapfam_bs]).to(device) for k, v in dapfam_q_enc.items()}
+                        outputs = model(**batch)
+                        dapfam_q_emb[i:i+dapfam_bs] = cls_pooling(
+                            outputs,
+                            dapfam_q_enc['attention_mask'][i:i+dapfam_bs],
+                        ).detach().cpu().numpy()
+                    for i in trange(0, len(dapfam_d_enc['input_ids']), dapfam_bs, desc="DAPFAM doc embeddings"):
+                        batch = {k: torch.tensor(v[i:i+dapfam_bs]).to(device) for k, v in dapfam_d_enc.items()}
+                        outputs = model(**batch)
+                        dapfam_d_emb[i:i+dapfam_bs] = cls_pooling(
+                            outputs,
+                            dapfam_d_enc['attention_mask'][i:i+dapfam_bs],
+                        ).detach().cpu().numpy()
+
+                torch.save(dapfam_q_emb, dapfam_q_path, pickle_protocol=4)
+                torch.save(dapfam_d_emb, dapfam_d_path, pickle_protocol=4)
+                print(f"DAPFAM embeddings shape: q={dapfam_q_emb.shape}, d={dapfam_d_emb.shape}")
+
+            dapfam_evaluation(
+                dapfam_queries_df.index.tolist(),
+                dapfam_documents_df.index.tolist(),
+                dapfam_q_emb,
+                dapfam_d_emb,
+                dapfam_cmap,
+                dapfam_query_ipc3,
+                dapfam_doc_ipc3,
+                k=100,
+            )
 
 
         ################################ Comprehensive Embedding Quality Evaluation ################################
@@ -2432,6 +2772,99 @@ def main():
 
         prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, citation_mapping_graded=citation_mapping_graded)
 
+        ############################ DAPFAM (TitlAbs -> TitlAbs) ############################
+        if run_dapfam:
+            dapfam_q_path = f'{dapfam_temp_dir}/query_embeddings.pt'
+            dapfam_d_path = f'{dapfam_temp_dir}/document_embeddings.pt'
+            if os.path.exists(dapfam_q_path) and os.path.exists(dapfam_d_path):
+                print("DAPFAM embeddings already cached.")
+                dapfam_q_emb = torch.load(dapfam_q_path, weights_only=False)
+                dapfam_d_emb = torch.load(dapfam_d_path, weights_only=False)
+            else:
+                if args.dapfam_texttype == 'plain':
+                    q_base = [
+                        " ".join(s for s in (t, a, extract_first_claim(c)) if s)
+                        for t, a, c in zip(
+                            dapfam_queries_df['title'].tolist(),
+                            dapfam_queries_df['abstract'].tolist(),
+                            dapfam_queries_df['claims_text'].tolist(),
+                        )
+                    ]
+                    d_base = [
+                        " ".join(s for s in (t, a, extract_first_claim(c)) if s)
+                        for t, a, c in zip(
+                            dapfam_documents_df['title'].tolist(),
+                            dapfam_documents_df['abstract'].tolist(),
+                            dapfam_documents_df['claims_text'].tolist(),
+                        )
+                    ]
+                else:
+                    q_base = [
+                        t + " " + a
+                        for t, a in zip(
+                            dapfam_queries_df['title'].tolist(),
+                            dapfam_queries_df['abstract'].tolist(),
+                        )
+                    ]
+                    d_base = [
+                        t + " " + a
+                        for t, a in zip(
+                            dapfam_documents_df['title'].tolist(),
+                            dapfam_documents_df['abstract'].tolist(),
+                        )
+                    ]
+                    if args.dapfam_texttype == 'tac':
+                        q_base = [
+                            txt + " " + extract_first_claim(c)
+                            for txt, c in zip(q_base, dapfam_queries_df['claims_text'].tolist())
+                        ]
+                        d_base = [
+                            txt + " " + extract_first_claim(c)
+                            for txt, c in zip(d_base, dapfam_documents_df['claims_text'].tolist())
+                        ]
+
+                dapfam_q_texts = [get_detailed_instruct(x) for x in q_base]
+                dapfam_d_texts = d_base
+
+                dapfam_q_enc = tokenizer(dapfam_q_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
+                dapfam_d_enc = tokenizer(dapfam_d_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
+
+                dapfam_q_emb = np.zeros((len(dapfam_q_enc['input_ids']), embedding_dim), dtype=np.float32)
+                dapfam_d_emb = np.zeros((len(dapfam_d_enc['input_ids']), embedding_dim), dtype=np.float32)
+                dapfam_bs = 32
+                with torch.no_grad():
+                    for i in trange(0, len(dapfam_q_enc['input_ids']), dapfam_bs, desc="DAPFAM query embeddings"):
+                        batch = {k: v[i:i+dapfam_bs].to(device) for k, v in dapfam_q_enc.items()}
+                        with autocast(dtype=torch.bfloat16):
+                            outputs = model(**batch)
+                        dapfam_q_emb[i:i+dapfam_bs] = last_token_pool(
+                            outputs.last_hidden_state,
+                            dapfam_q_enc['attention_mask'][i:i+dapfam_bs],
+                        ).detach().cpu().float().numpy()
+                    for i in trange(0, len(dapfam_d_enc['input_ids']), dapfam_bs, desc="DAPFAM doc embeddings"):
+                        batch = {k: v[i:i+dapfam_bs].to(device) for k, v in dapfam_d_enc.items()}
+                        with autocast(dtype=torch.bfloat16):
+                            outputs = model(**batch)
+                        dapfam_d_emb[i:i+dapfam_bs] = last_token_pool(
+                            outputs.last_hidden_state,
+                            dapfam_d_enc['attention_mask'][i:i+dapfam_bs],
+                        ).detach().cpu().float().numpy()
+
+                torch.save(dapfam_q_emb, dapfam_q_path, pickle_protocol=4)
+                torch.save(dapfam_d_emb, dapfam_d_path, pickle_protocol=4)
+                print(f"DAPFAM embeddings shape: q={dapfam_q_emb.shape}, d={dapfam_d_emb.shape}")
+
+            dapfam_evaluation(
+                dapfam_queries_df.index.tolist(),
+                dapfam_documents_df.index.tolist(),
+                dapfam_q_emb,
+                dapfam_d_emb,
+                dapfam_cmap,
+                dapfam_query_ipc3,
+                dapfam_doc_ipc3,
+                k=100,
+            )
+
 
         ################################ Comprehensive Embedding Quality Evaluation ################################
         # load embeddings from prior-art search task
@@ -2482,24 +2915,24 @@ def main():
         
         # Tokenize queries and retrieve
         abstract_queries_tokens = bm25s.tokenize(abstract_test_corpus.tolist(), stemmer=stemmer)
-        abstract_results, _ = abstract_retriever.retrieve(abstract_queries_tokens, k=100)
-        
-        # Map results back to document IDs (only abstract docs)
         original_doc_ids = list(documents.keys())  # Original doc IDs before multiplication
-        abstract_retrieved_ids = [[original_doc_ids[i] for i in result] for result in abstract_results]
-        
-        # Calculate recall@k for abstract-to-abstract
-        abstract_recalls = {}
+        n_abstract_docs = len(original_doc_ids)
+        # Retrieve full corpus for MAP/MRR; top-100 for recall/nDCG
+        abstract_results_full, _ = abstract_retriever.retrieve(abstract_queries_tokens, k=n_abstract_docs)
+        abstract_retrieved_full = [[original_doc_ids[i] for i in result] for result in abstract_results_full]
+        abstract_retrieved_top100 = [ids[:100] for ids in abstract_retrieved_full]
+
+        query_ids_list = list(queries.keys())
+        true_labels_abs = [citation_mapping.get(q, []) for q in query_ids_list]
+
+        # Calculate recall@k, nDCG@k, mAP, MRR
+        bm25_abstract_results = {}
         for k in [10, 20, 50, 100]:
-            abstract_recalls[k] = mean_recall_at_k(
-                [citation_mapping.get(q, []) for q in list(queries.keys())], 
-                abstract_retrieved_ids, 
-                k=k
-            )
-        
-        # Format BM25 results
-        bm25_abstract_results = {f"recall@{k}": recall for k, recall in abstract_recalls.items()}
-        print_metric_table(bm25_abstract_results, "BM25: Abstract → Abstract")
+            bm25_abstract_results[f'recall@{k}'] = mean_recall_at_k(true_labels_abs, abstract_retrieved_top100, k=k)
+            bm25_abstract_results[f'ndcg@{k}'] = mean_ndcg_at_k(true_labels_abs, abstract_retrieved_top100, k=k)
+        bm25_abstract_results['map'] = mean_average_precision(true_labels_abs, abstract_retrieved_full)
+        bm25_abstract_results['mrr'] = mean_reciprocal_rank(true_labels_abs, abstract_retrieved_full)
+        print_metric_table(bm25_abstract_results, "Query: abstract \u2192 Document: abstract")
         
         # 2) Claim-to-All evaluation (like other models' claim->all)
         print("\nBM25 Evaluation 2: Claim-to-All retrieval")
@@ -2519,43 +2952,103 @@ def main():
         all_retriever = bm25s.BM25()
         all_retriever.index(all_corpus_tokens)
         
-        # Tokenize queries and retrieve (k=300 to account for 3x document sections)
+        # Tokenize queries and retrieve full corpus for MAP/MRR
         claim_queries_tokens = bm25s.tokenize(claim_test_corpus, stemmer=stemmer)
-        claim_results, _ = all_retriever.retrieve(claim_queries_tokens, k=300)
-        
-        # Map results back to original document IDs and remove duplicates
-        # Document ordering: [abstracts, claims, inventions] each of length original_doc_count
         original_doc_count = len(original_doc_ids)
-        claim_retrieved_ids = []
-        
-        for result in claim_results:
-            doc_ids_for_query = []
-            for idx in result:
-                # Map index back to original document ID
-                if idx < original_doc_count:  # abstract section
-                    doc_id = original_doc_ids[idx]
-                elif idx < 2 * original_doc_count:  # claim section
-                    doc_id = original_doc_ids[idx - original_doc_count]
-                else:  # invention section
-                    doc_id = original_doc_ids[idx - 2 * original_doc_count]
-                doc_ids_for_query.append(doc_id)
-            
-            # Remove duplicates while preserving order, keep only top 100
-            unique_doc_ids = list(dict.fromkeys(doc_ids_for_query))[:100]
-            claim_retrieved_ids.append(unique_doc_ids)
-        
-        # Calculate recall@k for claim-to-all
-        claim_recalls = {}
+        claim_results_full, _ = all_retriever.retrieve(claim_queries_tokens, k=3 * original_doc_count)
+
+        def _dedup_claim_ids(results_array, original_doc_count, original_doc_ids):
+            """Map section indices back to doc IDs and deduplicate (order-preserving)."""
+            out = []
+            for result in results_array:
+                seen = {}
+                for idx in result:
+                    if idx < original_doc_count:
+                        doc_id = original_doc_ids[idx]
+                    elif idx < 2 * original_doc_count:
+                        doc_id = original_doc_ids[idx - original_doc_count]
+                    else:
+                        doc_id = original_doc_ids[idx - 2 * original_doc_count]
+                    if doc_id not in seen:
+                        seen[doc_id] = None
+                out.append(list(seen.keys()))
+            return out
+
+        claim_retrieved_full = _dedup_claim_ids(claim_results_full, original_doc_count, original_doc_ids)
+        claim_retrieved_top100 = [ids[:100] for ids in claim_retrieved_full]
+
+        true_labels_clm = [citation_mapping.get(q, []) for q in query_ids_list]
+
+        # Calculate recall@k, nDCG@k, mAP, MRR
+        bm25_claim_results = {}
         for k in [10, 20, 50, 100]:
-            claim_recalls[k] = mean_recall_at_k(
-                [citation_mapping.get(q, []) for q in list(queries.keys())], 
-                claim_retrieved_ids, 
-                k=k
+            bm25_claim_results[f'recall@{k}'] = mean_recall_at_k(true_labels_clm, claim_retrieved_top100, k=k)
+            bm25_claim_results[f'ndcg@{k}'] = mean_ndcg_at_k(true_labels_clm, claim_retrieved_top100, k=k)
+        bm25_claim_results['map'] = mean_average_precision(true_labels_clm, claim_retrieved_full)
+        bm25_claim_results['mrr'] = mean_reciprocal_rank(true_labels_clm, claim_retrieved_full)
+        print_metric_table(bm25_claim_results, "Query: claim \u2192 Document: all")
+
+        ############################ DAPFAM (TitlAbs -> TitlAbs) ############################
+        if run_dapfam:
+            print("Running BM25 DAPFAM evaluation")
+            if args.dapfam_texttype == 'plain':
+                dapfam_doc_texts = [
+                    " ".join(s for s in (t, a, extract_first_claim(c)) if s)
+                    for t, a, c in zip(
+                        dapfam_documents_df['title'].tolist(),
+                        dapfam_documents_df['abstract'].tolist(),
+                        dapfam_documents_df['claims_text'].tolist(),
+                    )
+                ]
+                dapfam_query_texts = [
+                    " ".join(s for s in (t, a, extract_first_claim(c)) if s)
+                    for t, a, c in zip(
+                        dapfam_queries_df['title'].tolist(),
+                        dapfam_queries_df['abstract'].tolist(),
+                        dapfam_queries_df['claims_text'].tolist(),
+                    )
+                ]
+            else:
+                dapfam_doc_texts = [
+                    t + " " + a
+                    for t, a in zip(
+                        dapfam_documents_df['title'].tolist(),
+                        dapfam_documents_df['abstract'].tolist(),
+                    )
+                ]
+                dapfam_query_texts = [
+                    t + " " + a
+                    for t, a in zip(
+                        dapfam_queries_df['title'].tolist(),
+                        dapfam_queries_df['abstract'].tolist(),
+                    )
+                ]
+                if args.dapfam_texttype == 'tac':
+                    dapfam_doc_texts = [
+                        txt + " " + extract_first_claim(c)
+                        for txt, c in zip(dapfam_doc_texts, dapfam_documents_df['claims_text'].tolist())
+                    ]
+                    dapfam_query_texts = [
+                        txt + " " + extract_first_claim(c)
+                        for txt, c in zip(dapfam_query_texts, dapfam_queries_df['claims_text'].tolist())
+                    ]
+
+            dapfam_corpus_tokens = bm25s.tokenize(dapfam_doc_texts, stopwords="en", stemmer=stemmer)
+            dapfam_retriever = bm25s.BM25()
+            dapfam_retriever.index(dapfam_corpus_tokens)
+
+            dapfam_query_tokens = bm25s.tokenize(dapfam_query_texts, stemmer=stemmer)
+            dapfam_results, _ = dapfam_retriever.retrieve(dapfam_query_tokens, k=100)
+
+            dapfam_doc_ids = list(dapfam_documents_df.index)
+            dapfam_predicted_labels = [[dapfam_doc_ids[i] for i in result] for result in dapfam_results]
+
+            dapfam_evaluation_from_predictions(
+                dapfam_queries_df.index.tolist(),
+                dapfam_predicted_labels,
+                dapfam_cmap,
+                k=100,
             )
-        
-        # Format BM25 claim results
-        bm25_claim_results = {f"recall@{k}": recall for k, recall in claim_recalls.items()}
-        print_metric_table(bm25_claim_results, "BM25: Claim → All Sections")
         
         print("\n📝 Note: BM25 evaluation completed. IPC classification")
         print("   evaluation are not applicable for sparse retrieval methods.")
@@ -2563,7 +3056,7 @@ def main():
 
 ########################################################################################################################################################
 ########################################################################################################################################################
-    elif "checkpoint" in args.model_name or "bestmodel" in args.model_name:
+    elif "checkpoint" in args.model_name or "bestmodel" in args.model_name or args.model_name.startswith("ZoeYou/PatentMap-V0-"):
         def load_checkpoint_model_and_tokenizer(checkpoint_path):
             """Smart checkpoint loader that handles tokenizer and model loading intelligently."""
             from transformers import AutoConfig, AutoTokenizer
@@ -2696,9 +3189,11 @@ def main():
             # Use same format as during training (consistent with patent.py batcher)
             train_texts, test_texts = train_dataset_filtered['text'], test_dataset_filtered['text']
 
-            # tokenize the texts
-            train_encodings = tokenizer(train_texts.tolist(), truncation=True, padding=True, max_length=512, return_tensors='pt').to(device)
-            test_encodings = tokenizer(test_texts.tolist(), truncation=True, padding=True, max_length=512, return_tensors='pt').to(device)
+            # tokenize the texts on CPU; batches are moved to GPU one-by-one below
+            # (keeping the full encodings on GPU wastes ~300MB and has caused
+            # cuBLAS workspace OOM on subsequent classifier training).
+            train_encodings = tokenizer(train_texts.tolist(), truncation=True, padding=True, max_length=512, return_tensors='pt')
+            test_encodings = tokenizer(test_texts.tolist(), truncation=True, padding=True, max_length=512, return_tensors='pt')
 
             # get the embeddings by batch
             train_embeddings = np.zeros((len(train_encodings['input_ids']), embedding_dim))
@@ -2720,6 +3215,14 @@ def main():
             # save the embeddings
             torch.save(train_embeddings, f'{IPC_dir_temp}/train_embeddings.pt')
             torch.save(test_embeddings, f'{IPC_dir_temp}/test_embeddings.pt')
+
+            # release tokenizer encodings before the IPC classifier trains on GPU
+            del train_encodings, test_encodings
+
+        # Free transient GPU memory accumulated during embedding computation so
+        # that cuBLAS can allocate its workspace for the IPC MLP without OOM.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         ipc_evaluation(train_embeddings, test_embeddings, train_labels, test_labels, train_types, test_types)
 
@@ -2803,6 +3306,88 @@ def main():
         # Use the standard evaluation for now, but note that minor differences may exist
         # due to different data organization methods between baseline.py and patent.py
         prior_art_search_evaluation(query_ids, doc_ids, query_embeddings, document_embeddings, citation_mapping, query_types, doc_types, citation_mapping_graded=citation_mapping_graded)
+
+        ############################ DAPFAM (TitlAbs -> TitlAbs) ############################
+        if run_dapfam:
+            dapfam_q_path = f'{dapfam_temp_dir}/query_embeddings.pt'
+            dapfam_d_path = f'{dapfam_temp_dir}/document_embeddings.pt'
+            if os.path.exists(dapfam_q_path) and os.path.exists(dapfam_d_path):
+                print("DAPFAM embeddings already cached.")
+                dapfam_q_emb = torch.load(dapfam_q_path, weights_only=False)
+                dapfam_d_emb = torch.load(dapfam_d_path, weights_only=False)
+            else:
+                if args.dapfam_texttype == 'plain':
+                    dapfam_q_texts = [
+                        " ".join(s for s in (t, a, extract_first_claim(c)) if s)
+                        for t, a, c in zip(
+                            dapfam_queries_df['title'].tolist(),
+                            dapfam_queries_df['abstract'].tolist(),
+                            dapfam_queries_df['claims_text'].tolist(),
+                        )
+                    ]
+                    dapfam_d_texts = [
+                        " ".join(s for s in (t, a, extract_first_claim(c)) if s)
+                        for t, a, c in zip(
+                            dapfam_documents_df['title'].tolist(),
+                            dapfam_documents_df['abstract'].tolist(),
+                            dapfam_documents_df['claims_text'].tolist(),
+                        )
+                    ]
+                else:
+                    dapfam_q_texts = [
+                        t + " [SEP] [abstract] " + a
+                        for t, a in zip(
+                            dapfam_queries_df['title'].tolist(),
+                            dapfam_queries_df['abstract'].tolist(),
+                        )
+                    ]
+                    dapfam_d_texts = [
+                        t + " [SEP] [abstract] " + a
+                        for t, a in zip(
+                            dapfam_documents_df['title'].tolist(),
+                            dapfam_documents_df['abstract'].tolist(),
+                        )
+                    ]
+                    if args.dapfam_texttype == 'tac':
+                        dapfam_q_texts = [
+                            txt + " [SEP] [claim] " + extract_first_claim(c)
+                            for txt, c in zip(dapfam_q_texts, dapfam_queries_df['claims_text'].tolist())
+                        ]
+                        dapfam_d_texts = [
+                            txt + " [SEP] [claim] " + extract_first_claim(c)
+                            for txt, c in zip(dapfam_d_texts, dapfam_documents_df['claims_text'].tolist())
+                        ]
+
+                dapfam_q_enc = tokenizer(dapfam_q_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
+                dapfam_d_enc = tokenizer(dapfam_d_texts, truncation=True, padding=True, max_length=512, return_tensors='pt')
+
+                dapfam_q_emb = np.zeros((len(dapfam_q_enc['input_ids']), embedding_dim), dtype=np.float32)
+                dapfam_d_emb = np.zeros((len(dapfam_d_enc['input_ids']), embedding_dim), dtype=np.float32)
+                with torch.no_grad():
+                    for i in trange(0, len(dapfam_q_enc['input_ids']), batch_size, desc="DAPFAM query embeddings"):
+                        batch = {key: val[i:i+batch_size].to(device) for key, val in dapfam_q_enc.items()}
+                        outputs = model(**batch, output_hidden_states=True, return_dict=True, sent_emb=True)
+                        dapfam_q_emb[i:i+batch_size] = outputs.pooler_output.detach().cpu().numpy()
+
+                    for i in trange(0, len(dapfam_d_enc['input_ids']), batch_size, desc="DAPFAM doc embeddings"):
+                        batch = {key: val[i:i+batch_size].to(device) for key, val in dapfam_d_enc.items()}
+                        outputs = model(**batch, output_hidden_states=True, return_dict=True, sent_emb=True)
+                        dapfam_d_emb[i:i+batch_size] = outputs.pooler_output.detach().cpu().numpy()
+
+                torch.save(dapfam_q_emb, dapfam_q_path, pickle_protocol=4)
+                torch.save(dapfam_d_emb, dapfam_d_path, pickle_protocol=4)
+                print(f"DAPFAM embeddings shape: q={dapfam_q_emb.shape}, d={dapfam_d_emb.shape}")
+
+            dapfam_evaluation(
+                dapfam_queries_df.index.tolist(),
+                dapfam_documents_df.index.tolist(),
+                dapfam_q_emb,
+                dapfam_d_emb,
+                dapfam_cmap,
+                dapfam_query_ipc3,
+                dapfam_doc_ipc3,
+                k=100,
+            )
 
         ################################ Comprehensive Embedding Quality Evaluation ################################
         # load embeddings from prior-art search task

@@ -226,7 +226,7 @@ class PriorArtEval(object):
         np.save(os.path.join(embedding_path, 'doc_ids.npy'), doc_ids)
 
 
-        # 2) abstract->abstract retrieval (single pair, mirrors evaluate.py prior_art_search_evaluation).
+        # 2) abstract->abstract retrieval
         results = {}
         texttype_q = "abstract"
         texttype_d = "abstract"
@@ -1301,54 +1301,34 @@ class DAPFAMEval(object):
         faiss.normalize_L2(D)
         sims = Q @ D.T  # (n_q, n_d), float32
 
-        # Vectorised IPC3 overlap matrix.
-        all_codes = sorted(
-            {c for s in self.query_ipc3 for c in s} | {c for s in self.doc_ipc3 for c in s}
-        )
-        code_to_idx = {c: i for i, c in enumerate(all_codes)}
-        n_codes = len(all_codes)
-        Q_ipc = np.zeros((len(query_ids), n_codes), dtype=np.int8)
-        for i, codes in enumerate(self.query_ipc3):
-            for c in codes:
-                Q_ipc[i, code_to_idx[c]] = 1
-        D_ipc = np.zeros((len(doc_ids), n_codes), dtype=np.int8)
-        for i, codes in enumerate(self.doc_ipc3):
-            for c in codes:
-                D_ipc[i, code_to_idx[c]] = 1
-        overlap = (Q_ipc.astype(np.int32) @ D_ipc.T.astype(np.int32)) > 0  # bool (n_q, n_d)
-
         q_ids_arr = np.asarray(query_ids)
         d_ids_arr = np.asarray(doc_ids)
 
-        NEG_INF = np.float32(-1e30)
+        # Full-corpus top-k once: argpartition + stable sort of the k entries.
+        n_d = sims.shape[1]
+        top_k = min(k, n_d)
+        if top_k == n_d:
+            top_k_indices = np.argsort(-sims, axis=1, kind='stable')
+        else:
+            part = np.argpartition(-sims, kth=top_k - 1, axis=1)[:, :top_k]
+            row_idx = np.arange(sims.shape[0])[:, None]
+            part_sims = sims[row_idx, part]
+            order = np.argsort(-part_sims, axis=1, kind='stable')
+            top_k_indices = part[row_idx, order]
+
+        # Predicted ranked id lists per query (identical across subsets).
+        predicted_labels_full = [d_ids_arr[top_k_indices[i]].tolist() for i in range(len(q_ids_arr))]
+
         results = {}
         for subset in ("ALL", "IN", "OUT"):
-            if subset == "ALL":
-                masked_sims = sims
-            elif subset == "IN":
-                masked_sims = np.where(overlap, sims, NEG_INF)
-            else:  # OUT
-                masked_sims = np.where(overlap, NEG_INF, sims)
-
-            n_d = masked_sims.shape[1]
-            top_k = min(k, n_d)
-            if top_k == n_d:
-                top_k_indices = np.argsort(-masked_sims, axis=1, kind='stable')
-            else:
-                part = np.argpartition(-masked_sims, kth=top_k - 1, axis=1)[:, :top_k]
-                row_idx = np.arange(masked_sims.shape[0])[:, None]
-                part_sims = masked_sims[row_idx, part]
-                order = np.argsort(-part_sims, axis=1, kind='stable')
-                top_k_indices = part[row_idx, order]
-
             cmap = self.cmap[subset]
             true_labels_list, predicted_labels_list = [], []
-            for q_idx in range(len(q_ids_arr)):
-                true_labels = cmap.get(q_ids_arr[q_idx], [])
+            for q_idx, qid in enumerate(q_ids_arr):
+                true_labels = cmap.get(qid, [])
                 if not true_labels:
                     continue  # skip queries without positives in this subset
-                predicted_labels_list.append(d_ids_arr[top_k_indices[q_idx]].tolist())
                 true_labels_list.append(true_labels)
+                predicted_labels_list.append(predicted_labels_full[q_idx])
 
             results[subset] = {
                 f'recall@{k}': mean_recall_at_k(true_labels_list, predicted_labels_list, k=k),
