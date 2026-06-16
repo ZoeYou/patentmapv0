@@ -282,9 +282,16 @@ If you use this code in your research, please consider citing:
 }
 ```
 
+
 ## License
 
-CC BY-NC 4.0
+This repository is released under the **PatentMap v0 Non-Commercial License**.
+
+You may use, copy, modify, and distribute this project for academic, educational, personal, and non-profit research purposes only. Commercial use is not permitted without prior written permission from the copyright holder.
+
+Commercial use includes, but is not limited to, use in commercial products, paid services, SaaS platforms, consulting, patent analytics services, internal business workflows, commercial R&D, or commercial machine learning systems.
+
+See the [LICENSE](./LICENSE) file for details.
 
 
 ## Contact
