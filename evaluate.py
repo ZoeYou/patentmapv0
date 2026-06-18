@@ -2924,12 +2924,14 @@ def main():
 
         query_ids_list = list(queries.keys())
         true_labels_abs = [citation_mapping.get(q, []) for q in query_ids_list]
+        true_graded_abs = [citation_mapping_graded.get(q, {}) for q in query_ids_list]
 
         # Calculate recall@k, nDCG@k, mAP, MRR
         bm25_abstract_results = {}
         for k in [10, 20, 50, 100]:
             bm25_abstract_results[f'recall@{k}'] = mean_recall_at_k(true_labels_abs, abstract_retrieved_top100, k=k)
             bm25_abstract_results[f'ndcg@{k}'] = mean_ndcg_at_k(true_labels_abs, abstract_retrieved_top100, k=k)
+            bm25_abstract_results[f'ndcg_graded@{k}'] = mean_ndcg_at_k_graded(true_graded_abs, abstract_retrieved_top100, k=k)
         bm25_abstract_results['map'] = mean_average_precision(true_labels_abs, abstract_retrieved_full)
         bm25_abstract_results['mrr'] = mean_reciprocal_rank(true_labels_abs, abstract_retrieved_full)
         print_metric_table(bm25_abstract_results, "Query: abstract \u2192 Document: abstract")
@@ -2978,12 +2980,14 @@ def main():
         claim_retrieved_top100 = [ids[:100] for ids in claim_retrieved_full]
 
         true_labels_clm = [citation_mapping.get(q, []) for q in query_ids_list]
+        true_graded_clm = [citation_mapping_graded.get(q, {}) for q in query_ids_list]
 
         # Calculate recall@k, nDCG@k, mAP, MRR
         bm25_claim_results = {}
         for k in [10, 20, 50, 100]:
             bm25_claim_results[f'recall@{k}'] = mean_recall_at_k(true_labels_clm, claim_retrieved_top100, k=k)
             bm25_claim_results[f'ndcg@{k}'] = mean_ndcg_at_k(true_labels_clm, claim_retrieved_top100, k=k)
+            bm25_claim_results[f'ndcg_graded@{k}'] = mean_ndcg_at_k_graded(true_graded_clm, claim_retrieved_top100, k=k)
         bm25_claim_results['map'] = mean_average_precision(true_labels_clm, claim_retrieved_full)
         bm25_claim_results['mrr'] = mean_reciprocal_rank(true_labels_clm, claim_retrieved_full)
         print_metric_table(bm25_claim_results, "Query: claim \u2192 Document: all")
