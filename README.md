@@ -10,6 +10,21 @@ A patent document embedding and similarity learning framework that uses self-sup
 - **Flexible Data Augmentation**: Supports different augmentation strategies.
 - **Comprehensive Evaluation**: Built-in evaluation framework for patent representation learning tasks.
 
+
+## Pretrained Models
+
+Pretrained PatentMap v0 checkpoints are available on HuggingFace:
+
+- [ZoeYou/patentmapv0-models](https://huggingface.co/ZoeYou/patentmapv0-models)
+
+These checkpoints include models trained with the self-supervised contrastive objectives described in this repository. After downloading a checkpoint, you can evaluate it with:
+
+```bash
+python evaluate.py \
+    --model_name /path/to/checkpoint \
+    --output_dir ./evaluation_results
+```
+
 ## Requirements
 
 This project targets Python 3.8+ and CUDA-compatible GPUs for training (if you want to use GPU acceleration).
